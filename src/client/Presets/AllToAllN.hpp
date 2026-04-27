@@ -23,9 +23,10 @@ THE SOFTWARE.
 #include <limits>
 #include "EnvVars.hpp"
 
-int AllToAllRdmaPreset(EnvVars&           ev,
-                       size_t      const  numBytesPerTransfer,
-                       std::string const  presetName)
+int AllToAllRdmaPreset(EnvVars&          ev,
+                       size_t      const numBytesPerTransfer,
+                       std::string const presetName,
+                       bool        const bytesSpecified)
 {
   if (TransferBench::GetNumRanks() > 1) {
     Utils::Print("[ERROR]a2an preset currently not supported for multi-node\n");

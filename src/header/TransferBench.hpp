@@ -61,15 +61,26 @@ THE SOFTWARE.
 #endif
 
 #if defined(__NVCC__)
+#include <cuda.h>
 #include <cuda_runtime.h>
+#ifdef NVML_ENABLED
 #include <nvml.h>
+#endif
 #else
-#include <hip/hip_ext.h>
-#include <hip/hip_runtime.h>
-#include <hsa/hsa.h>
-#include <hsa/hsa_ext_amd.h>
+#include "hip/hip_ext.h"
+#include "hip/hip_runtime.h"
+#include "hsa/hsa.h"
+#include "hsa/hsa_ext_amd.h"
+#ifdef AMD_SMI_ENABLED
+#include "amd_smi/amdsmi.h"
+#endif
 #endif
 /// @endcond
+
+// Batched DMA executor is only supported with HIP >= 7.1 and CUDA 12.8
+#if (defined(HIP_VERSION) && (HIP_VERSION >= 70100000)) || (defined(CUDA_VERSION) && (CUDA_VERSION >= 12080))
+#define BMA_EXEC_ENABLED
+#endif
 
 namespace TransferBench
 {
@@ -78,7 +89,7 @@ namespace TransferBench
   using std::set;
   using std::vector;
 
-  constexpr char VERSION[] = "1.66";
+  constexpr char VERSION[] = "1.67";
 
   /**
    * Enumeration of supported Executor types
@@ -91,11 +102,12 @@ namespace TransferBench
     EXE_GPU_GFX      = 1,                       ///<  GPU kernel-based executor (subExecutor = threadblock/CU)
     EXE_GPU_DMA      = 2,                       ///<  GPU SDMA executor         (subExecutor = not supported)
     EXE_NIC          = 3,                       ///<  NIC RDMA executor         (subExecutor = queue pair)
-    EXE_NIC_NEAREST  = 4                        ///<  NIC RDMA nearest executor (subExecutor = queue pair)
+    EXE_NIC_NEAREST  = 4,                       ///<  NIC RDMA nearest executor (subExecutor = queue pair)
+    EXE_GPU_BDMA     = 5,                       ///<  GPU Batched SDMA executor (subExecutor = batch item)
   };
-  char const ExeTypeStr[6] = "CGDIN";
+  char const ExeTypeStr[7] = "CGDINB";
   inline bool IsCpuExeType(ExeType e){ return e == EXE_CPU; }
-  inline bool IsGpuExeType(ExeType e){ return e == EXE_GPU_GFX || e == EXE_GPU_DMA; }
+  inline bool IsGpuExeType(ExeType e){ return e == EXE_GPU_GFX || e == EXE_GPU_DMA || e == EXE_GPU_BDMA; }
   inline bool IsNicExeType(ExeType e){ return e == EXE_NIC || e == EXE_NIC_NEAREST; }
 
   /**
@@ -234,6 +246,7 @@ namespace TransferBench
   struct NicOptions
   {
     size_t      chunkBytes      = 1<<30;        ///< How much bytes to transfer at a time
+    int         cqPollBatch     = 4;            ///< Maximum CQ entries polled per call
     int         ibGidIndex      = -1;           ///< GID Index for RoCE NICs (-1 is auto)
     uint8_t     ibPort          = 1;            ///< NIC port number to be used
     int         ipAddressFamily = 4;            ///< 4=IPv4, 6=IPv6 (used for auto GID detection)
@@ -315,6 +328,7 @@ namespace TransferBench
     ErrResult() = default;
 #if defined(__NVCC__)
     ErrResult(cudaError_t  err);
+    ErrResult(CUresult     err);
 #else
     ErrResult(hipError_t   err);
     ErrResult(hsa_status_t err);
@@ -547,16 +561,17 @@ namespace TransferBench
   std::string GetHostname(int targetRank = -1);
 
   /**
-   * @param[in] targetRank  Rank to query (-1 for local rank)
-   * @returns Gets the physical pod identifier for the target rank
+   * @param[in] targetRank Rank to query (-1 for local rank)
+   * @returns Gets the unique pod identifier for the target rank based on its physical and virtual pod
    **/
-  std::string GetPpodId(int targetRank = -1);
+  int64_t GetPodIdx(int targetRank = -1);
 
   /**
-   * @param[in] targetRank  Rank to query (-1 for local rank)
-   * @returns Gets the virtual pod identifier for the target rank
+   * @param[in] targetRank  Remote rank to query
+   * @param[in] sourceRank  Base rank to query (-1 for local rank)
+   * @returns Whether source and target ranks belong to the same pod
    **/
-  int GetVpodId(int targetRank = -1);
+  bool IsSamePod(int targetRank, int sourceRank = -1);
 
   /**
    * @param[in] exeDevice       The specific Executor to query
@@ -581,7 +596,7 @@ namespace TransferBench
    */
   ErrResult ParseTransfers(std::string str,
                            std::vector<Transfer>& transfers);
-};
+}
 //==========================================================================================
 // End of TransferBench API
 //==========================================================================================
@@ -599,6 +614,10 @@ namespace TransferBench
   #define hipError_t                                         cudaError_t
   #define hipEvent_t                                         cudaEvent_t
   #define hipStream_t                                        cudaStream_t
+  #define hipMemAllocationProp                               CUmemAllocationProp
+  #define hipMemGenericAllocationHandle_t                    CUmemGenericAllocationHandle
+  #define hipMemAccessDesc                                   CUmemAccessDesc
+  #define hipMemFabricHandle_t                               CUmemFabricHandle
 
   // Enumerations
   #define hipDeviceAttributeClockRate                        cudaDevAttrClockRate
@@ -607,9 +626,15 @@ namespace TransferBench
   #define hipErrorPeerAccessAlreadyEnabled                   cudaErrorPeerAccessAlreadyEnabled
   #define hipFuncCachePreferShared                           cudaFuncCachePreferShared
   #define hipMemcpyDefault                                   cudaMemcpyDefault
+  #define hipMemcpyKind                                      cudaMemcpyKind
   #define hipMemcpyDeviceToHost                              cudaMemcpyDeviceToHost
   #define hipMemcpyHostToDevice                              cudaMemcpyHostToDevice
   #define hipSuccess                                         cudaSuccess
+  #define hipMemLocationTypeDevice                           CU_MEM_LOCATION_TYPE_DEVICE
+  #define hipMemAllocationTypePinned                         CU_MEM_ALLOCATION_TYPE_PINNED
+  #define hipMemHandleTypeFabric                             CU_MEM_HANDLE_TYPE_FABRIC
+  #define hipMemAllocationGranularityRecommended             CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+  #define hipMemAccessFlagsProtReadWrite                     CU_MEM_ACCESS_FLAGS_PROT_READWRITE
 
   // Functions
   #define hipDeviceCanAccessPeer                             cudaDeviceCanAccessPeer
@@ -632,12 +657,26 @@ namespace TransferBench
   #define hipMallocManaged                                   cudaMallocManaged
   #define hipMemcpy                                          cudaMemcpy
   #define hipMemcpyAsync                                     cudaMemcpyAsync
+  #define hipMemcpyBatchAsync                                cudaMemcpyBatchAsync
   #define hipMemset                                          cudaMemset
   #define hipMemsetAsync                                     cudaMemsetAsync
   #define hipSetDevice                                       cudaSetDevice
   #define hipStreamCreate                                    cudaStreamCreate
   #define hipStreamDestroy                                   cudaStreamDestroy
   #define hipStreamSynchronize                               cudaStreamSynchronize
+  #define hipMemGetAllocationGranularity                     cuMemGetAllocationGranularity
+  #define hipMemCreate                                       cuMemCreate
+  // cu* driver API returns CUresult; cast to cudaError_t so callers can use a single error variable
+  #define hipMemAddressReserve(...)                          ((cudaError_t)cuMemAddressReserve(__VA_ARGS__))
+  #define hipMemMap(...)                                     ((cudaError_t)cuMemMap(__VA_ARGS__))
+  #define hipMemSetAccess(...)                               ((cudaError_t)cuMemSetAccess(__VA_ARGS__))
+  #define hipMemUnmap(...)                                   ((cudaError_t)cuMemUnmap(__VA_ARGS__))
+  #define hipMemRelease(...)                                 ((cudaError_t)cuMemRelease(__VA_ARGS__))
+  #define hipMemAddressFree(...)                             ((cudaError_t)cuMemAddressFree(__VA_ARGS__))
+  #define hipMemExportToShareableHandle(...)                 ((cudaError_t)cuMemExportToShareableHandle(__VA_ARGS__))
+  #define hipMemImportFromShareableHandle(...)               ((cudaError_t)cuMemImportFromShareableHandle(__VA_ARGS__))
+
+  using gpu_device_ptr = CUdeviceptr;
 
   // Define float2 addition operator for NVIDIA platform
   __device__ inline float2& operator +=(float2& a, const float2& b)
@@ -656,42 +695,59 @@ namespace TransferBench
     a.w += b.w;
     return a;
   }
+#else
+  using gpu_device_ptr = void*;
 #endif
 
 // Helper macro functions
 //==========================================================================================
 
 // Macro for collecting CU/SM GFX kernel is running on
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
-#define GetHwId(hwId) hwId = 0
+#if defined(__GFX9__)
+  #define GetHwId(hwId) asm volatile ("s_getreg_b32 %0, hwreg(HW_REG_HW_ID)" : "=s" (hwId))
+#elif defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__)
+  #define GetHwId(hwId) asm volatile ("s_getreg_b32 %0, hwreg(HW_REG_HW_ID1)" : "=s" (hwId))
 #elif defined(__NVCC__)
-#define GetHwId(hwId) asm("mov.u32 %0, %smid;" : "=r"(hwId))
+  #define GetHwId(hwId) asm("mov.u32 %0, %smid;" : "=r"(hwId))
 #else
-#define GetHwId(hwId) asm volatile ("s_getreg_b32 %0, hwreg(HW_REG_HW_ID)" : "=s" (hwId));
+  #define GetHwId(hwId) hwId = 0
 #endif
 
 // Macro for collecting XCC GFX kernel is running on
 #if defined(__gfx942__) || defined(__gfx950__)
-#define GetXccId(val) asm volatile ("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s" (val));
+#define GetXccId(val) asm volatile ("s_getreg_b32 %0, hwreg(HW_REG_XCC_ID)" : "=s" (val))
+#elif defined(__GFX12__)
+#define GetXccId(val) \
+  { asm volatile ("s_sendmsg_rtn_b32 %0, 0x87 \n" \
+                  "s_wait_kmcnt 0"                \
+                  : "=s" (val));                  \
+    val = ((val >> 16) & 0xF);                    \
+  }
 #else
 #define GetXccId(val) val = 0
 #endif
 
 // Error check macro (NOTE: This will return even for ERR_WARN)
-#define ERR_CHECK(cmd)            \
-  do {                            \
-    ErrResult err = (cmd);        \
-    if (err.errType != ERR_NONE)  \
-      return err;                 \
+#define ERR_CHECK(cmd)                                                       \
+  do {                                                                       \
+    ErrResult err = (cmd);                                                   \
+    if (err.errType != ERR_NONE) {                                           \
+      err.errMsg += std::string(" [") + __FILE__ + ":" +                     \
+                    std::to_string(__LINE__) + " in " + __func__ + "]";      \
+      return err;                                                            \
+    }                                                                        \
   } while (0)
 
 // Appends warn/fatal errors to a list, return false if fatal
-#define ERR_APPEND(cmd, list)     \
-  do {                            \
-    ErrResult err = (cmd);        \
-    if (err.errType != ERR_NONE)  \
-      list.push_back(err);        \
-    if (err.errType == ERR_FATAL) \
+#define ERR_APPEND(cmd, list)                                                \
+  do {                                                                       \
+    ErrResult err = (cmd);                                                   \
+    if (err.errType != ERR_NONE) {                                           \
+      err.errMsg += std::string(" [") + __FILE__ + ":" +                     \
+                    std::to_string(__LINE__) + " in " + __func__ + "]";      \
+      list.push_back(err);                                                   \
+    }                                                                        \
+    if (err.errType == ERR_FATAL)                                            \
       return false;               \
   } while (0)
 
@@ -746,7 +802,7 @@ namespace {
 //========================================================================================
 
   int   constexpr MAX_BLOCKSIZE  = 1024;               // Max threadblock size
-  int   constexpr MAX_UNROLL     = 8;                  // Max unroll factor
+  int   constexpr MAX_UNROLL     = 16;                 // Max unroll factor
   int   constexpr MAX_SRCS       = 8;                  // Max srcs per Transfer
   int   constexpr MAX_DSTS       = 8;                  // Max dsts per Transfer
   int   constexpr MEMSET_CHAR    = 75;                 // Value to memset (char)
@@ -825,6 +881,18 @@ namespace {
     int GetCommMode() const { return commMode; }
 
     bool& IsVerbose() { return verbose; }
+
+    /**
+     * Helper logging function that logs only on output ranks
+     * - In MPI mode - Rank 0 only
+     * - In socket mode - All ranks unless TB_SINGLE_LOG=1
+     */
+    void Log(const char* format, ...) const;
+
+    /**
+     * Helper function that logs Transfers being executed to a config file
+     */
+    void LogTransfers(std::vector<Transfer> const& transfers);
 
     // Communication functions
     /**
@@ -949,8 +1017,8 @@ namespace {
     void GetClosestGpusToNic(std::vector<int>& gpuIndices, int nicIndex, int targetRank = -1) const;
 
     std::string GetHostname(int targetRank) const;
-    std::string GetPpodId(int targetRank) const;
-    int GetVpodId(int targetRank) const;
+    int64_t  GetPodIdx(int targetRank) const;
+    bool IsSamePod(int targetRank, int sourceRank) const;
     std::string GetExecutorName(ExeDevice exeDevice) const;
     int NicIsActive(int nicIndex, int targetRank) const;
 
@@ -977,6 +1045,8 @@ namespace {
     int rank;
     int numRanks;
     bool verbose = false;
+    bool rankDoesOutput = true;
+    FILE* dumpCfgFile = nullptr;
 
 #if !defined(__NVCC__)
     std::vector<hsa_agent_t> cpuAgents;
@@ -999,9 +1069,9 @@ namespace {
     // Topology related
     struct RankTopology
     {
-      char hostname[33];
-      char ppodId[256];
-      int  vpodId;
+      char    hostname[33];
+      char    ppodId[16];
+      int64_t vpodId;
 
       std::map<ExeType,            int>         numExecutors;
       std::map<pair<ExeType, int>, int>         numExecutorSubIndices;
@@ -1018,6 +1088,7 @@ namespace {
 
     void SetupSocketCommunicator();
     void SetupMpiCommunicator();
+    void CollectPodMembership(char* ppodId, int64_t& vpodId);
     void GetRankTopology(RankTopology& topo);
     void CollectTopology();
     std::string GetCpuName() const;
@@ -1343,8 +1414,36 @@ namespace {
     return ERR_NONE;
   }
 
+#ifdef POD_COMM_ENABLED
+  static ErrResult GetMemAllocationProp(MemDevice const& memDevice, hipMemAllocationProp& prop)
+  {
+
+    switch (memDevice.memType) {
+    case MEM_CPU: case MEM_CPU_CLOSEST: case MEM_GPU:
+      prop.type = hipMemAllocationTypePinned; break;
+    case MEM_CPU_UNCACHED: case MEM_GPU_UNCACHED:
+#if defined (__NVCC__)
+      return {ERR_FATAL, "Uncached memory type unsupported in CUDA"};
+#else
+      prop.type = hipMemAllocationTypeUncached; break;
+#endif
+    default:
+      return {ERR_FATAL, "Unsupported memory type for pod communication"};
+    }
+
+    prop.requestedHandleTypes = hipMemHandleTypeFabric;
+//  at this point shouldn't have any memtype other than device
+//    ERR_CHECK(GetMemLocation(memDevice, prop.location));
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = memDevice.memIndex;
+    return ERR_NONE;
+  }
+#endif
+
   // Allocate memory
-  static ErrResult AllocateMemory(MemDevice memDevice, size_t numBytes, void** memPtr, bool isShareable = false)
+  static ErrResult AllocateMemory(MemDevice memDevice, size_t numBytes, void** memPtr,
+                                  size_t* actualBytes = NULL,
+                                  hipMemGenericAllocationHandle_t* memHandle = NULL)
   {
     if (numBytes == 0) {
       return {ERR_FATAL, "Unable to allocate 0 bytes"};
@@ -1352,20 +1451,71 @@ namespace {
     *memPtr = nullptr;
 
     MemType const& memType = memDevice.memType;
+    int deviceIdx = memDevice.memIndex;
+    if (memType == MEM_CPU_CLOSEST) {
+      deviceIdx = GetClosestCpuNumaToGpu(memDevice.memIndex);
+    }
+
+    // If memHandle is provided, allocate sharable memory
+    if (memHandle != NULL) {
+#ifdef POD_COMM_ENABLED
+      ERR_CHECK(hipSetDevice(deviceIdx));
+      // Prepare HIP memory allocation properties structure
+      hipMemAllocationProp prop = {};
+      ERR_CHECK(GetMemAllocationProp(memDevice, prop));
+
+      // Determine recommended allocation granularity
+      size_t granularity;
+      ERR_CHECK(hipMemGetAllocationGranularity(&granularity, &prop,
+                                               hipMemAllocationGranularityRecommended));
+      size_t roundedUpBytes = (numBytes + granularity - 1) / granularity * granularity;
+      if (actualBytes != NULL) *actualBytes = roundedUpBytes;
+
+      // Create memory allocation described by properties and size
+      ERR_CHECK(hipMemCreate(memHandle, roundedUpBytes, &prop, 0));
+
+      // Reserve a virtual address range for the memory allocation
+      ERR_CHECK(hipMemAddressReserve((gpu_device_ptr*)memPtr, roundedUpBytes, 0, 0, 0));
+
+      // Map the allocation handle to the reserved address range
+      ERR_CHECK(hipMemMap((gpu_device_ptr)*memPtr, roundedUpBytes, 0, *memHandle, 0));
+
+      // Specify memory access descriptor to enable local read/write
+      hipMemAccessDesc desc;
+//      ERR_CHECK(GetMemLocation(memDevice, desc.location));
+      desc.location.type = hipMemLocationTypeDevice;
+      desc.location.id = memDevice.memIndex;
+      desc.flags = hipMemAccessFlagsProtReadWrite;
+
+      // Set access flags for virtual address range
+      ERR_CHECK(hipMemSetAccess((gpu_device_ptr)*memPtr, roundedUpBytes, &desc, 1));
+
+      // Clear the memory
+      if (IsCpuMemType(memType)) {
+        memset(*memPtr, 0, roundedUpBytes);
+        // Check that the allocated pages are actually on the correct NUMA node
+        ERR_CHECK(CheckPages((char*)*memPtr, roundedUpBytes, deviceIdx));
+      } else if (IsGpuMemType(memType)) {
+        ERR_CHECK(hipSetDevice(memDevice.memIndex));
+        ERR_CHECK(hipMemset(*memPtr, 0, numBytes));
+        ERR_CHECK(hipDeviceSynchronize());
+      }
+      return ERR_NONE;
+#else
+      return {ERR_FATAL, "Unable to allocate sharable memory if not compiled with pod communication support"};
+#endif
+    } else {
+      if (actualBytes != NULL) *actualBytes = numBytes;
+    }
 
     if (IsCpuMemType(memType)) {
-      // Determine which NUMA device to use
-      int numaIdx = memDevice.memIndex;
-      if (memType == MEM_CPU_CLOSEST) {
-        numaIdx = GetClosestCpuNumaToGpu(memDevice.memIndex);
-      }
 
       // Set NUMA policy prior to call to hipHostMalloc
-      numa_set_preferred(numaIdx);
+      numa_set_preferred(deviceIdx);
 
       // Allocate host-pinned memory (should respect NUMA mem policy)
       int flags = 0;
-#if !defined(__NVCC__)
+#if !defined (__NVCC__)
       flags |= hipHostMallocNumaUser;
 #endif
       if (memType == MEM_CPU || memType == MEM_CPU_CLOSEST) {
@@ -1393,12 +1543,12 @@ namespace {
 #endif
 #endif
       } else if (memType == MEM_CPU_UNPINNED) {
-        *memPtr = numa_alloc_onnode(numBytes, numaIdx);
+        *memPtr = numa_alloc_onnode(numBytes, deviceIdx);
       }
 
       // Check that the allocated pages are actually on the correct NUMA node
       memset(*memPtr, 0, numBytes);
-      ERR_CHECK(CheckPages((char*)*memPtr, numBytes, numaIdx));
+      ERR_CHECK(CheckPages((char*)*memPtr, numBytes, deviceIdx));
 
       // Reset to default numa mem policy
       numa_set_preferred(-1);
@@ -1437,30 +1587,44 @@ namespace {
   }
 
   // Deallocate memory
-  static ErrResult DeallocateMemory(MemType memType, void *memPtr, size_t const bytes)
+  static ErrResult DeallocateMemory(MemType memType, void *memPtr, size_t const bytes,
+                                    hipMemGenericAllocationHandle_t* memHandle = nullptr)
   {
     // Avoid deallocating nullptr
     if (memPtr == nullptr)
       return {ERR_FATAL, "Attempted to free null pointer for %lu bytes", bytes};
 
-    switch (memType) {
-    case MEM_CPU: case MEM_CPU_CLOSEST: case MEM_CPU_COHERENT: case MEM_CPU_NONCOHERENT: case MEM_CPU_UNCACHED:
-    {
-      ERR_CHECK(hipHostFree(memPtr));
-      break;
-    }
-    case MEM_CPU_UNPINNED:
-    {
-      numa_free(memPtr, bytes);
-      break;
-    }
-    case MEM_GPU : case MEM_GPU_FINE: case MEM_GPU_UNCACHED: case MEM_MANAGED:
-    {
-      ERR_CHECK(hipFree(memPtr));
-      break;
-    }
-    default:
-      return {ERR_FATAL, "Attempting to deallocate unrecognized memory type (%d)", memType};
+    if (memHandle == nullptr || *memHandle == NULL) {
+      switch (memType) {
+      case MEM_CPU: case MEM_CPU_CLOSEST: case MEM_CPU_COHERENT: case MEM_CPU_NONCOHERENT: case MEM_CPU_UNCACHED:
+      {
+        ERR_CHECK(hipHostFree(memPtr));
+        break;
+      }
+      case MEM_CPU_UNPINNED:
+      {
+        numa_free(memPtr, bytes);
+        break;
+      }
+      case MEM_GPU : case MEM_GPU_FINE: case MEM_GPU_UNCACHED: case MEM_MANAGED:
+      {
+        ERR_CHECK(hipFree(memPtr));
+        break;
+      }
+      default:
+        return {ERR_FATAL, "Attempting to deallocate unrecognized memory type (%d)", memType};
+      }
+    } else {
+#ifdef POD_COMM_ENABLED
+      // Unmap the backing memory of the given virtual address
+      ERR_CHECK(hipMemUnmap((gpu_device_ptr)memPtr, bytes));
+      // Release the backing memory via its handle
+      ERR_CHECK(hipMemRelease(*memHandle));
+      // Free virtual address range reservation
+      ERR_CHECK(hipMemAddressFree((gpu_device_ptr)memPtr, bytes));
+#else
+      return {ERR_FATAL, "Unable to deallocate sharable memory if not compiled with pod communication support"};
+#endif
     }
     return ERR_NONE;
   }
@@ -1681,7 +1845,7 @@ namespace {
   {
     if (GetCommMode() == COMM_NONE) return;
     if (System::Get().IsVerbose()) {
-      printf("[INFO] Rank %d checking config consistency\n", GetRank());
+      System::Get().Log("[INFO] Rank %d checking config consistency\n", GetRank());
     }
 
     // To check consistency, compare against rank 0
@@ -1703,6 +1867,11 @@ namespace {
     // Compare data options
     {
       DataOptions data = cfg.data;
+      // Null out vector members before sizeof-broadcast: vectors carry heap pointers that are
+      // invalid on other ranks; freeing a remote pointer on scope exit causes a segfault
+      // These fields are permitted to differ across ranks and are not compared below
+      decltype(data.fillPattern)().swap(data.fillPattern);
+      decltype(data.fillCompress)().swap(data.fillCompress);
       System::Get().Broadcast(root, sizeof(data), &data);
 
       // data.alwaysValidate is permitted to be different across ranks
@@ -1747,6 +1916,10 @@ namespace {
     // Compare GFX Executor options
     {
       GfxOptions gfx = cfg.gfx;
+      // Same as above: null out vector members before sizeof-broadcast
+      // both fields are permitted to differ across ranks
+      decltype(gfx.cuMask)().swap(gfx.cuMask);
+      decltype(gfx.prefXccTable)().swap(gfx.prefXccTable);
       System::Get().Broadcast(root, sizeof(gfx), &gfx);
       if (gfx.blockOrder     != cfg.gfx.blockOrder)     ADD_ERROR("cfg.gfx.blockOrder");
       if (gfx.blockSize      != cfg.gfx.blockSize)      ADD_ERROR("cfg.gfx.blockSize");
@@ -1775,6 +1948,7 @@ namespace {
       NicOptions nic = cfg.nic;
       System::Get().Broadcast(root, sizeof(nic), &nic);
       if (nic.chunkBytes      != cfg.nic.chunkBytes)      ADD_ERROR("cfg.nic.chunkBytes");
+      if (nic.cqPollBatch     != cfg.nic.cqPollBatch)     ADD_ERROR("cfg.nic.cqPollBatch");
       // nic.ibGidIndex  is permitted to be different across ranks
       // nic.ibPort      is permitted to be different across ranks
       if (nic.ipAddressFamily != cfg.nic.ipAddressFamily) ADD_ERROR("cfg.nic.ipAddressFamily");
@@ -1885,6 +2059,9 @@ namespace {
     if (cfg.nic.chunkBytes == 0 || (cfg.nic.chunkBytes % 4 != 0)) {
       errors.push_back({ERR_FATAL, "[nic.chunkBytes] must be a non-negative multiple of 4"});
     }
+    if (cfg.nic.cqPollBatch <= 0) {
+      errors.push_back({ERR_FATAL, "[nic.cqPollBatch] must be positive"});
+    }
 #endif
 
     // NVIDIA specific
@@ -1919,7 +2096,7 @@ namespace {
     if (GetCommMode() == COMM_NONE) return;
 
     if (System::Get().IsVerbose()) {
-      printf("[INFO] Rank %d checking transfers consistency\n", GetRank());
+      System::Get().Log("[INFO] Rank %d checking transfers consistency\n", GetRank());
     }
 
     // To check consistency, compare against rank 0
@@ -1967,6 +2144,18 @@ namespace {
     #undef ADD_ERROR
   }
 
+  // Returns true if the given Transfer requires pod communication
+  static bool IsPodTransfer(Transfer const& t)
+  {
+    if (IsCpuExeType(t.exeDevice.exeType) || IsGpuExeType(t.exeDevice.exeType)) {
+      for (auto const& src : t.srcs)
+        if (src.memRank != t.exeDevice.exeRank) return true;
+      for (auto const& dst : t.dsts)
+        if (dst.memRank != t.exeDevice.exeRank) return true;
+    }
+    return false;
+  }
+
   // Validate Transfers to execute - returns true if and only if fatal error detected
   static bool TransfersHaveErrors(ConfigOptions         const& cfg,
                                   std::vector<Transfer> const& transfers,
@@ -1981,16 +2170,24 @@ namespace {
     CheckMultiNodeTransferConsistency(transfers, errors);
 
     // Per-Transfer checks
+    bool hasFatalError = false;
     for (size_t i = 0; i < transfers.size(); i++) {
       Transfer const& t = transfers[i];
 
-      if (t.numBytes == 0)
+      if (t.numBytes == 0) {
         errors.push_back({ERR_FATAL, "Transfer %d: Cannot perform 0-byte transfers", i});
+        break;
+      }
+
+      if (t.numBytes % 4) {
+        errors.push_back({ERR_FATAL, "Transfer %d: numBytes (%lu) must be a multiple of 4\n", i, t.numBytes});
+        break;
+      }
 
       // Each subexecutor is assigned a multiple of cfg.data.blockBytes, however this may
       // mean that some subexecutors might not have any work assigned to them if the amount to
       // transfer is small
-      if (t.exeDevice.exeType == EXE_GPU_GFX || t.exeDevice.exeType == EXE_CPU) {
+      if (t.exeDevice.exeType == EXE_GPU_GFX || t.exeDevice.exeType == EXE_CPU || t.exeDevice.exeType == EXE_GPU_BDMA) {
         size_t const N               = t.numBytes / sizeof(float);
         int    const targetMultiple  = cfg.data.blockBytes / sizeof(float);
         int    const maxSubExecToUse = std::min((size_t)(N + targetMultiple - 1) / targetMultiple,
@@ -2003,25 +2200,36 @@ namespace {
       }
 
       // Check sources and destinations
-      if (t.srcs.empty() && t.dsts.empty())
+      if (t.srcs.empty() && t.dsts.empty()) {
         errors.push_back({ERR_FATAL, "Transfer %d: Must have at least one source or destination", i});
+        break;
+      }
 
       for (int j = 0; j < t.srcs.size(); j++) {
         ErrResult err = CheckMemDevice(t.srcs[j]);
-        if (err.errType != ERR_NONE)
+        if (err.errType != ERR_NONE) {
           errors.push_back({ERR_FATAL, "Transfer %d: SRC %d: %s", i, j, err.errMsg.c_str()});
+          hasFatalError = true;
+          break;
+        }
       }
+      if (hasFatalError) break;
+
       for (int j = 0; j < t.dsts.size(); j++) {
         ErrResult err = CheckMemDevice(t.dsts[j]);
-        if (err.errType != ERR_NONE)
+        if (err.errType != ERR_NONE) {
           errors.push_back({ERR_FATAL, "Transfer %d: DST %d: %s", i, j, err.errMsg.c_str()});
+          hasFatalError = true;
+          break;
+        }
       }
+      if (hasFatalError) break;
 
       // Check executor rank
       if (t.exeDevice.exeRank < 0 || t.exeDevice.exeRank >= GetNumRanks()) {
         errors.push_back({ERR_FATAL,
             "Rank index for executor must be between 0 and %d (instead of %d)", GetNumRanks() - 1, t.exeDevice.exeRank});
-        continue;
+        break;
       }
 
       executors.insert(t.exeDevice);
@@ -2030,56 +2238,77 @@ namespace {
 
       switch (t.exeDevice.exeType) {
       case EXE_CPU:
-        if (t.exeDevice.exeIndex < 0 || t.exeDevice.exeIndex >= numExecutors)
+        if (t.exeDevice.exeIndex < 0 || t.exeDevice.exeIndex >= numExecutors) {
           errors.push_back({ERR_FATAL,
                             "Transfer %d: CPU index must be between 0 and %d (instead of %d) for rank %d",
                             i, numExecutors - 1, t.exeDevice.exeIndex, t.exeDevice.exeRank});
+          hasFatalError = true;
+        }
         break;
       case EXE_GPU_GFX:
         if (t.exeDevice.exeIndex < 0 || t.exeDevice.exeIndex >= numExecutors) {
           errors.push_back({ERR_FATAL,
                             "Transfer %d: GFX index must be between 0 and %d (instead of %d) for rank %d",
                             i, numExecutors - 1, t.exeDevice.exeIndex, t.exeDevice.exeRank});
+          hasFatalError = true;
+          break;
         } else {
           if (t.exeSubIndex != -1) {
 #if defined(__NVCC__)
             errors.push_back({ERR_FATAL,
                               "Transfer %d: GFX executor subindex not supported on NVIDIA hardware", i});
+            hasFatalError = true;
 #else
             useSubIndexCount[t.exeDevice]++;
             int numSubIndices = GetNumExecutorSubIndices(t.exeDevice);
-            if (t.exeSubIndex >= numSubIndices)
+            if (t.exeSubIndex >= numSubIndices) {
               errors.push_back({ERR_FATAL,
                   "Transfer %d: GFX subIndex (XCC) must be between 0 and %d for rank %d", i, numSubIndices - 1, t.exeDevice.exeRank});
+              hasFatalError = true;
+              break;
+            }
 #endif
           }
         }
         break;
       case EXE_GPU_DMA:
-        if (t.srcs.size() != 1 || t.dsts.size() != 1) {
+        if (t.srcs.size() != 1) {
           errors.push_back({ERR_FATAL,
-                            "Transfer %d: DMA executor must have exactly 1 source and 1 destination", i});
+                            "Transfer %d: DMA executor must have exactly 1 source", i});
+          hasFatalError = true;
+          break;
+        }
+        if (t.dsts.size() < 1) {
+          errors.push_back({ERR_FATAL,
+                            "Transfer %d: DMA executor must have at least 1 destination", i});
+          hasFatalError = true;
+          break;
         }
 
         if (t.exeDevice.exeIndex < 0 || t.exeDevice.exeIndex >= numExecutors) {
           errors.push_back({ERR_FATAL,
                             "Transfer %d: DMA index must be between 0 and %d (instead of %d) for rank %d",
                             i, numExecutors - 1, t.exeDevice.exeIndex, t.exeDevice.exeRank});
-          // Cannot proceed with any further checks
-          continue;
+          hasFatalError = true;
+          break;
         }
 
         if (t.exeSubIndex != -1) {
 #if defined(__NVCC__)
           errors.push_back({ERR_FATAL,
                             "Transfer %d: DMA executor subindex not supported on NVIDIA hardware", i});
+          hasFatalError = true;
+          break;
 #else
           useSubIndexCount[t.exeDevice]++;
           int numSubIndices = GetNumExecutorSubIndices(t.exeDevice);
-          if (t.exeSubIndex >= numSubIndices)
+          if (t.exeSubIndex >= numSubIndices) {
             errors.push_back({ERR_FATAL,
                               "Transfer %d: DMA subIndex (engine) must be between 0 and %d",
                               i, numSubIndices - 1});
+            hasFatalError = true;
+            break;
+          }
 
           // Check that engine Id exists between agents
           hsa_agent_t srcAgent, dstAgent;
@@ -2087,29 +2316,46 @@ namespace {
           err = System::Get().GetHsaAgent(t.srcs[0], srcAgent);
           if (err.errType != ERR_NONE) {
             errors.push_back(err);
-            if (err.errType == ERR_FATAL) break;
-          }
-          err = System::Get().GetHsaAgent(t.dsts[0], dstAgent);
-          if (err.errType != ERR_NONE) {
-            errors.push_back(err);
-            if (err.errType == ERR_FATAL) break;
+            if (err.errType == ERR_FATAL) {
+              hasFatalError = true;
+              break;
+            }
+
           }
 
-          // Skip check of engine Id mask for self copies
-          if (srcAgent.handle != dstAgent.handle) {
-            uint32_t engineIdMask = 0;
-            err = hsa_amd_memory_copy_engine_status(dstAgent, srcAgent, &engineIdMask);
+          int numDsts = (int)t.dsts.size();
+          for (int dstIdx = 0; dstIdx < numDsts; dstIdx++) {
+            err = System::Get().GetHsaAgent(t.dsts[dstIdx], dstAgent);
             if (err.errType != ERR_NONE) {
               errors.push_back(err);
-              if (err.errType == ERR_FATAL) break;
+              if (err.errType == ERR_FATAL) {
+                hasFatalError = true;
+                break;
+              }
             }
-            hsa_amd_sdma_engine_id_t sdmaEngineId = (hsa_amd_sdma_engine_id_t)(1U << t.exeSubIndex);
-            if (!(sdmaEngineId & engineIdMask)) {
-              errors.push_back({ERR_FATAL,
-                  "Transfer %d: DMA %d.%d does not exist or cannot copy between src/dst",
-                  i, t.exeDevice.exeIndex, t.exeSubIndex});
+
+            // Skip check of engine Id mask for self copies
+            if (srcAgent.handle != dstAgent.handle) {
+              uint32_t engineIdMask = 0;
+              err = hsa_amd_memory_copy_engine_status(dstAgent, srcAgent, &engineIdMask);
+              if (err.errType != ERR_NONE) {
+                errors.push_back(err);
+                if (err.errType == ERR_FATAL) {
+                  hasFatalError = true;
+                  break;
+                }
+              }
+              hsa_amd_sdma_engine_id_t sdmaEngineId = (hsa_amd_sdma_engine_id_t)(1U << t.exeSubIndex);
+              if (!(sdmaEngineId & engineIdMask)) {
+                errors.push_back({ERR_FATAL,
+                    "Transfer %d: DMA %d.%d does not exist or cannot copy between src/dst",
+                    i, t.exeDevice.exeIndex, t.exeSubIndex});
+                hasFatalError = true;
+                break;
+              }
             }
           }
+          if (hasFatalError) break;
 #endif
         }
 
@@ -2132,12 +2378,67 @@ namespace {
           }
         }
         break;
+      case EXE_GPU_BDMA:
+#ifdef BMA_EXEC_ENABLED
+        if (t.srcs.size() != 1) {
+          errors.push_back({ERR_FATAL,
+                            "Transfer %d: BMA executor must have exactly 1 source", i});
+          hasFatalError = true;
+          break;
+        }
+        if (t.dsts.size() < 1) {
+          errors.push_back({ERR_FATAL,
+                            "Transfer %d: BMA executor must have at least 1 destination", i});
+          hasFatalError = true;
+          break;
+        }
+
+        if (t.exeDevice.exeIndex < 0 || t.exeDevice.exeIndex >= numExecutors) {
+          errors.push_back({ERR_FATAL,
+                            "Transfer %d: BMA index must be between 0 and %d (instead of %d) for rank %d",
+                            i, numExecutors - 1, t.exeDevice.exeIndex, t.exeDevice.exeRank});
+          hasFatalError = true;
+          break;
+        }
+
+        if (t.exeSubIndex != -1) {
+          errors.push_back({ERR_FATAL,
+              "Transfer %d: BMA executor does not support executor subindices (SDMA engine selection)", i});
+          hasFatalError = true;
+          break;
+        }
+
+        if (!IsGpuMemType(t.srcs[0].memType) && !IsGpuMemType(t.dsts[0].memType)) {
+          errors.push_back({ERR_WARN,
+              "Transfer %d: No GPU memory for source or destination.  Copy might not execute on BMA %d",
+              i, t.exeDevice.exeIndex});
+        } else {
+          if (IsGpuMemType(t.srcs[0].memType)) {
+            if (t.srcs[0].memIndex != t.exeDevice.exeIndex) {
+              errors.push_back({ERR_WARN,
+                  "Transfer %d: BMA executor may use the source memory device (%d) not (%d)",
+                  i, t.srcs[0].memIndex, t.exeDevice.exeIndex});
+            }
+          } else if (t.dsts[0].memIndex != t.exeDevice.exeIndex) {
+            errors.push_back({ERR_WARN,
+                "Transfer %d: BMA executor may use the destination memory device (%d) not (%d)",
+                i, t.dsts[0].memIndex, t.exeDevice.exeIndex});
+          }
+        }
+        break;
+#else
+        errors.push_back({ERR_FATAL,
+            "Transfer %d: BMA executor requires ROCm 7.1 or newer (AMD HIP with hipMemcpyBatchAsync)", i});
+        hasFatalError = true;
+        break;
+#endif
       case EXE_NIC: case EXE_NIC_NEAREST:
 #ifdef NIC_EXEC_ENABLED
       {
         // NIC Executors can only execute a copy operation
         if (t.srcs.size() != 1 || t.dsts.size() != 1) {
           errors.push_back({ERR_FATAL, "Transfer %d: NIC executor requires single SRC and single DST", i});
+          hasFatalError = true;
           break;
         }
 
@@ -2149,6 +2450,7 @@ namespace {
         if (srcMemRank != srcExeRank && dstMemRank != srcExeRank) {
           errors.push_back({ERR_FATAL,
               "Transfer %d: NIC executor rank (%d) must be same as SRC memory rank (%d) or DST memory rank (%d)", i, srcExeRank, srcMemRank, dstMemRank});
+          hasFatalError = true;
           break;
         }
 
@@ -2161,8 +2463,12 @@ namespace {
         if (srcExeDevice.exeIndex < 0 || srcExeDevice.exeIndex >= GetNumExecutors(EXE_NIC, srcExeRank)) {
           errors.push_back({ERR_FATAL, "Transfer %d: Rank %d SRC NIC executor indexes an out-of-range NIC (%d).  Detected %d NICs",
               i, srcExeRank, srcExeDevice.exeIndex, GetNumExecutors(EXE_NIC, srcExeRank)});
+          hasFatalError = true;
+          break;
         } else if (!NicIsActive(srcExeDevice.exeIndex, srcExeDevice.exeRank)) {
           errors.push_back({ERR_FATAL, "Transfer %d: Rank %d SRC NIC executor %d is not active", i, srcExeDevice.exeRank, srcExeDevice.exeIndex});
+          hasFatalError = true;
+          break;
         }
 
         // The DST NIC executor facilitates the copy but issues no commands
@@ -2174,29 +2480,51 @@ namespace {
         if (dstExeDevice.exeIndex < 0 || dstExeDevice.exeIndex >= GetNumExecutors(EXE_NIC, dstExeRank)) {
           errors.push_back({ERR_FATAL, "Transfer %d: Rank %d DST NIC executor indexes an out-of-range NIC (%d).  Detected %d NICs",
               i, dstExeRank, dstExeDevice.exeIndex, GetNumExecutors(EXE_NIC, dstExeRank)});
+          hasFatalError = true;
+          break;
         } else if (!NicIsActive(dstExeDevice.exeIndex, dstExeDevice.exeRank)) {
           errors.push_back({ERR_FATAL, "Transfer %d: Rank %d DST NIC executor %d is not active", i, dstExeDevice.exeRank, dstExeDevice.exeIndex});
+          hasFatalError = true;
+          break;
         }
       }
 #else
       errors.push_back({ERR_FATAL, "Transfer %d: NIC executor is requested but is not available.", i});
+      hasFatalError = true;
 #endif
       break;
       }
 
+      // Skip further tests if fatal error detected
+      if (hasFatalError) break;
+
       // Check for multi-node support
-      // Currently this is not supported for CPU/GPU executors
-      if (IsCpuExeType(t.exeDevice.exeType) || IsGpuExeType(t.exeDevice.exeType)) {
-        bool crossRank = false;
+      if (IsPodTransfer(t)) {
+#ifndef POD_COMM_ENABLED
+        errors.push_back({ERR_FATAL,
+            "Transfer %d: Cross-rank GPU memory access requires pod communication support (HIP 8.0+)", i});
+        hasFatalError = true;
+        break;
+#endif
+        // In order to support pod communication, the participanting ranks need to be members of the same pod
+        int exeRank = t.exeDevice.exeRank;
+        bool samePod = true;
+
         for (auto const& src : t.srcs) {
-          crossRank |= (src.memRank != t.exeDevice.exeRank);
+          if (!(samePod = IsSamePod(src.memRank, exeRank)))
+            break;
         }
-        for (auto const& dst : t.dsts) {
-          crossRank |= (dst.memRank != t.exeDevice.exeRank);
+        if (samePod) {
+          for (auto const& dst : t.dsts) {
+            if (!(samePod = IsSamePod(dst.memRank, exeRank)))
+              break;
+          }
         }
-        if (crossRank) {
+
+        if (!samePod || IsCpuExeType(t.exeDevice.exeType)) {
           errors.push_back({ERR_FATAL, "Transfer %d: Executor on rank %d can not access memory across ranks\n",
               i, t.exeDevice.exeRank});
+          break;
         }
       }
 
@@ -2205,6 +2533,7 @@ namespace {
         errors.push_back({ERR_FATAL, "Transfer %d: # of subexecutors must be positive", i});
       else
         totalSubExecs[t.exeDevice] += t.numSubExecs;
+
     }
 
     int gpuMaxHwQueues = 4;
@@ -2246,6 +2575,7 @@ namespace {
                             "GPU %d specifies XCC on only %d of %d Transfers. "
                             "Must either specific none or all",
                             exeDevice.exeIndex, useSubIndexCount[exeDevice], transferCount[exeDevice]});
+          break;
         }
 
         if (cfg.gfx.useMultiStream && transferCount[exeDevice] > gpuMaxHwQueues) {
@@ -2263,6 +2593,7 @@ namespace {
                             "DMA %d specifies engine on only %d of %d Transfers. "
                             "Must either specific none or all",
                             exeDevice.exeIndex, useSubIndexCount[exeDevice], transferCount[exeDevice]});
+          break;
         }
         if (transferCount[exeDevice] > gpuMaxHwQueues) {
           errors.push_back({ERR_WARN,
@@ -2275,6 +2606,15 @@ namespace {
           errors.push_back({ERR_WARN,
                             "DMA functionality disabled due to environment variable HSA_ENABLE_SDMA=0. "
                             "DMA %d copies will fallback to blit (GFX) kernels", exeDevice.exeIndex});
+        break;
+      }
+      case EXE_GPU_BDMA:
+      {
+        if (transferCount[exeDevice] > gpuMaxHwQueues) {
+          errors.push_back({ERR_WARN,
+                           "BMA %d attempting %d parallel transfers, however GPU_MAX_HW_QUEUES only set to %d",
+                           exeDevice.exeIndex, transferCount[exeDevice], gpuMaxHwQueues});
+        }
         break;
       }
       default:
@@ -2314,12 +2654,17 @@ namespace {
   };
 
   // Internal resources allocated per Transfer
+  typedef hipMemGenericAllocationHandle_t memHandle_t;
   struct TransferResources
   {
     int                        transferIdx;       ///< The associated Transfer
     size_t                     numBytes;          ///< Number of bytes to Transfer
     vector<float*>             srcMem;            ///< Source memory
     vector<float*>             dstMem;            ///< Destination memory
+    vector<size_t>             srcActualBytes;    ///< Actual amount of src memory allocated (after padding)
+    vector<size_t>             dstActualBytes;    ///< Actual amount of dst memory allocated (after padding)
+    vector<memHandle_t>        srcMemHandle;      ///< Memory handles for source memory
+    vector<memHandle_t>        dstMemHandle;      ///< Memory handles for destination memory
     vector<SubExecParam>       subExecParamCpu;   ///< Defines subarrays for each subexecutor
     vector<int>                subExecIdx;        ///< Indices into subExecParamGpu
     int                        numaNode;          ///< NUMA node to use for this Transfer
@@ -2329,13 +2674,13 @@ namespace {
 
     // For targeted-SDMA
 #if !defined(__NVCC__)
-    hsa_agent_t                dstAgent;          ///< DMA destination memory agent
+    vector<hsa_agent_t>        dstAgent;          ///< DMA destination memory agents
     hsa_agent_t                srcAgent;          ///< DMA source memory agent
     hsa_signal_t               signal;            ///< HSA signal for completion
     hsa_amd_sdma_engine_id_t   sdmaEngineId;      ///< DMA engine ID
 #endif
 
-// For IBV executor
+    // For IBV executor
 #ifdef NIC_EXEC_ENABLED
     int                        srcNicIndex;       ///< SRC NIC index
     int                        dstNicIndex;       ///< DST NIC index
@@ -2361,6 +2706,13 @@ namespace {
     bool                       srcIsExeNic;       ///< Whether SRC or DST NIC initiates traffic
     vector<vector<ibv_sge>>    sgePerQueuePair;   ///< Scatter-gather elements per queue pair
     vector<vector<ibv_send_wr>>sendWorkRequests;  ///< Send work requests per queue pair
+#endif
+
+    // For BMA executor
+#ifdef BMA_EXEC_ENABLED
+    vector<void*>              batchDsts;         ///< Destination pointers (per batch item)
+    vector<void*>              batchSrcs;         ///< Source pointers (per batch item)
+    vector<size_t>             batchBytes;        ///< Bytes to copy (per batch item)
 #endif
 
     // Counters
@@ -2548,9 +2900,9 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       int numIbvDevices = 0;
       ibv_device** deviceList = ibv_get_device_list(&numIbvDevices);
 
-      // Check for NIC_FILTER
+      // Check for TB_NIC_FILTER
       // By default, accept all NIC names
-      std::string nicFilterPattern = getenv("NIC_FILTER") ? getenv("NIC_FILTER") : ".*";
+      std::string nicFilterPattern = getenv("TB_NIC_FILTER") ? getenv("TB_NIC_FILTER") : ".*";
 
       if (deviceList && numIbvDevices > 0) {
         // Loop over each device to collect information
@@ -2639,11 +2991,11 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
                                    bool               isLast = true)
   {
     if (!node.address.empty()) {
-      printf("%s%s%s", prefix.c_str(), (isLast ? "└── " : "├── "), node.address.c_str());
+      System::Get().Log("%s%s%s", prefix.c_str(), (isLast ? "└── " : "├── "), node.address.c_str());
       if (!node.description.empty()) {
-        printf("(%s)", node.description.c_str());
+        System::Get().Log("(%s)", node.description.c_str());
       }
-      printf("\n");
+      System::Get().Log("\n");
     }
     auto const& children = node.children;
     for (auto it = children.begin(); it != children.end(); ++it) {
@@ -2765,7 +3117,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     iss >> std::hex >> domain >> delimiter >> bus >> delimiter >> device >> delimiter >> function;
     if (iss.fail()) {
 #ifdef VERBS_DEBUG
-      printf("Invalid PCIe address format: %s\n", pcieAddress.c_str());
+      System::Get().Log("Invalid PCIe address format: %s\n", pcieAddress.c_str());
 #endif
       return -1;
     }
@@ -3049,7 +3401,9 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         }
       }
       // Create SRC completion queues
-      IBV_PTR_CALL(rss.srcCompQueue, ibv_create_cq, rss.srcContext, cfg.nic.queueSize, NULL, NULL, 0);
+      // Ensure CQ size is at least as large as the number of queue pairs to avoid overflow
+      int srcCQSize = std::max(cfg.nic.queueSize, static_cast<int>(rss.qpCount));
+      IBV_PTR_CALL(rss.srcCompQueue, ibv_create_cq, rss.srcContext, srcCQSize, NULL, NULL, 0);
       // Get SRC port attributes
       IBV_CALL(ibv_query_port, rss.srcContext, port, &rss.srcPortAttr);
       // Check for RDMA over Converged Ethernet (RoCE) and update GID index appropriately
@@ -3113,7 +3467,9 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         }
       }
       // Create DST completion queues
-      IBV_PTR_CALL(rss.dstCompQueue, ibv_create_cq, rss.dstContext, cfg.nic.queueSize, NULL, NULL, 0);
+      // Ensure CQ size is at least as large as the number of queue pairs to avoid overflow
+      int dstCQSize = std::max(cfg.nic.queueSize,static_cast<int>(rss.qpCount));
+      IBV_PTR_CALL(rss.dstCompQueue, ibv_create_cq, rss.dstContext, dstCQSize, NULL, NULL, 0);
       // Get DST port attributes
       IBV_CALL(ibv_query_port, rss.dstContext, port, &rss.dstPortAttr);
       // Check for RDMA over Converged Ethernet (RoCE) and update GID index appropriately
@@ -3145,7 +3501,6 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     System::Get().Broadcast(srcMemRank, sizeof(rss.srcPortAttr.link_layer), &rss.srcPortAttr.link_layer);
     System::Get().Broadcast(dstMemRank, sizeof(rss.dstPortAttr.link_layer), &rss.dstPortAttr.link_layer);
     if (rss.srcPortAttr.link_layer != rss.dstPortAttr.link_layer) {
-      printf("[ERROR] Link layer do not match (%d vs %d)\n", rss.srcPortAttr.link_layer, rss.dstPortAttr.link_layer);
       return {ERR_FATAL, "SRC NIC (%d) [Rank %d] and DST NIC (%d) [Rank %d] do not have the same link layer [%d vs %d]",
         rss.srcNicIndex, srcMemRank, rss.dstNicIndex, dstMemRank, rss.srcPortAttr.link_layer, rss.dstPortAttr.link_layer};
     }
@@ -3177,13 +3532,38 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 
       // Move queue pairs to ready-to-receive (RTR), using exchanged connection info
       // Then move them to read-to-send (RTS)
+      // Broadcast each rank's result so all ranks fail together rather than
+      // hanging on the next iteration's Broadcast when qpCount > 1.
+      struct QpTransitionResult { ErrType errType; bool rtrFailed; };
+      static_assert(std::is_trivially_copyable<QpTransitionResult>::value, "QpTransitionResult must be trivially copyable for MPI broadcast");
+      QpTransitionResult srcQpResult = {ERR_NONE, false};
       if (GetRank() == srcMemRank) {
-        ERR_CHECK(TransitionQpToRtr(rss.srcQueuePairs[i], dstConnInfo, port, srcIsRoCE, rss.srcPortAttr.active_mtu));
-        ERR_CHECK(TransitionQpToRts(rss.srcQueuePairs[i]));
+        ErrResult err = TransitionQpToRtr(rss.srcQueuePairs[i], dstConnInfo, port, srcIsRoCE, rss.srcPortAttr.active_mtu);
+        srcQpResult.rtrFailed = (err.errType != ERR_NONE);
+        if (err.errType == ERR_NONE) {
+          err = TransitionQpToRts(rss.srcQueuePairs[i]);
+        }
+        srcQpResult.errType = err.errType;
       }
+      System::Get().Broadcast(srcMemRank, sizeof(srcQpResult), &srcQpResult);
+      if (srcQpResult.errType != ERR_NONE) {
+        return {ERR_FATAL, "SRC rank %d failed to transition QP %d to %s",
+                srcMemRank, i, srcQpResult.rtrFailed ? "RTR" : "RTS"};
+      }
+
+      QpTransitionResult dstQpResult = {ERR_NONE, false};
       if (GetRank() == dstMemRank) {
-        ERR_CHECK(TransitionQpToRtr(rss.dstQueuePairs[i], srcConnInfo, port, dstIsRoCE, rss.dstPortAttr.active_mtu));
-        ERR_CHECK(TransitionQpToRts(rss.dstQueuePairs[i]));
+        ErrResult err = TransitionQpToRtr(rss.dstQueuePairs[i], srcConnInfo, port, dstIsRoCE, rss.dstPortAttr.active_mtu);
+        dstQpResult.rtrFailed = (err.errType != ERR_NONE);
+        if (err.errType == ERR_NONE) {
+          err = TransitionQpToRts(rss.dstQueuePairs[i]);
+        }
+        dstQpResult.errType = err.errType;
+      }
+      System::Get().Broadcast(dstMemRank, sizeof(dstQpResult), &dstQpResult);
+      if (dstQpResult.errType != ERR_NONE) {
+        return {ERR_FATAL, "DST rank %d failed to transition QP %d to %s",
+                dstMemRank, i, dstQpResult.rtrFailed ? "RTR" : "RTS"};
       }
 
       // Prepare scatter-gather element / work request for this queue pair in advance
@@ -3198,10 +3578,10 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         auto const   lkey      = (nicExeRank == srcMemRank ? rss.srcMemRegion->lkey        : rss.dstMemRegion->lkey);
         auto const   rkey      = (nicExeRank == srcMemRank ? dstConnInfo.rkey              : srcConnInfo.rkey);
         if (System::Get().IsVerbose()) {
-          printf("[INFO] Transfer %d SubExec %d executed by rank %d NIC %d is %s with %lu chunks\n",
-                 rss.transferIdx, i, nicExeRank, nicExeDevice.exeIndex,
-                 (opcode == IBV_WR_RDMA_WRITE ? "remote write" : "remote read"),
-                 numChunks);
+          System::Get().Log("[INFO] Transfer %d SubExec %d executed by rank %d NIC %d is %s with %lu chunks\n",
+                            rss.transferIdx, i, nicExeRank, nicExeDevice.exeIndex,
+                            (opcode == IBV_WR_RDMA_WRITE ? "remote write" : "remote read"),
+                            numChunks);
         }
         rss.sgePerQueuePair[i].resize(numChunks, {});
         rss.sendWorkRequests[i].resize(numChunks, {});
@@ -3227,8 +3607,8 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
           wr.wr.rdma.rkey        = rkey;
 
           if (System::Get().IsVerbose()) {
-            printf("[INFO] Transfer %d SubExec %d chunk %lu local %p remote %p of size %lu\n",
-                   rss.transferIdx, i, chunkIdx, (void*)local, (void*)remote, currChunkBytes);
+            System::Get().Log("[INFO] Transfer %d SubExec %d chunk %lu local %p remote %p of size %lu\n",
+                              rss.transferIdx, i, chunkIdx, (void*)local, (void*)remote, currChunkBytes);
           }
 
           // Increment locations
@@ -3353,16 +3733,16 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       std::shuffle(lineTypes.begin(), lineTypes.end(), gen);
 
       // Apply zero-ing
-      int dumpLines = getenv("DUMP_LINES") ? atoi(getenv("DUMP_LINES")) : 0;
+      int dumpLines = getenv("TB_DUMP_LINES") ? atoi(getenv("TB_DUMP_LINES")) : 0;
 
       if (dumpLines) {
-        printf("Input pattern 64B line statistics for bufferIdx %d:\n", bufferIdx);
-        printf("Total lines: %lu\n", numLines);
-        printf("- 0: Random : %8lu (%8.3f%%)\n", lineCounts[0], 100.0 * lineCounts[0] / (1.0 * numLines));
-        printf("- 1: 1B0    : %8lu (%8.3f%%)\n", lineCounts[1], 100.0 * lineCounts[1] / (1.0 * numLines));
-        printf("- 2: 2B0    : %8lu (%8.3f%%)\n", lineCounts[2], 100.0 * lineCounts[2] / (1.0 * numLines));
-        printf("- 3: 4B0    : %8lu (%8.3f%%)\n", lineCounts[3], 100.0 * lineCounts[3] / (1.0 * numLines));
-        printf("- 4: 32B0   : %8lu (%8.3f%%)\n", lineCounts[4], 100.0 * lineCounts[4] / (1.0 * numLines));
+        System::Get().Log("Input pattern 64B line statistics for bufferIdx %d:\n", bufferIdx);
+        System::Get().Log("Total lines: %lu\n", numLines);
+        System::Get().Log("- 0: Random : %8lu (%8.3f%%)\n", lineCounts[0], 100.0 * lineCounts[0] / (1.0 * numLines));
+        System::Get().Log("- 1: 1B0    : %8lu (%8.3f%%)\n", lineCounts[1], 100.0 * lineCounts[1] / (1.0 * numLines));
+        System::Get().Log("- 2: 2B0    : %8lu (%8.3f%%)\n", lineCounts[2], 100.0 * lineCounts[2] / (1.0 * numLines));
+        System::Get().Log("- 3: 4B0    : %8lu (%8.3f%%)\n", lineCounts[3], 100.0 * lineCounts[3] / (1.0 * numLines));
+        System::Get().Log("- 4: 32B0   : %8lu (%8.3f%%)\n", lineCounts[4], 100.0 * lineCounts[4] / (1.0 * numLines));
       }
 
       for (int line = 0; line < numLines; line++) {
@@ -3394,12 +3774,12 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         }
 
         if (line < dumpLines) {
-          printf("Line %02d [%d]: ", line, lineTypes[line]);
+          System::Get().Log("Line %02d [%d]: ", line, lineTypes[line]);
           for (int j = 63; j >= 0; j--){
-            printf("%02x ", linePtr[j]);
-            if (j % 16 == 0) printf(" ");
+            System::Get().Log("%02x ", linePtr[j]);
+            if (j % 16 == 0) System::Get().Log(" ");
           }
-          printf("\n");
+          System::Get().Log("\n");
         }
       }
     } else {
@@ -3445,6 +3825,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         if (IsCpuMemType(t.dsts[dstIdx].memType) || cfg.data.validateDirect) {
           output = (rss->dstMem[dstIdx]) + initOffset;
         } else {
+          ERR_CHECK(hipSetDevice(t.dsts[dstIdx].memIndex));
           ERR_CHECK(hipMemcpy(outputBuffer.data(), (rss->dstMem[dstIdx]) + initOffset, t.numBytes, hipMemcpyDefault));
           ERR_CHECK(hipDeviceSynchronize());
           output = outputBuffer.data();
@@ -3538,9 +3919,93 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       }
     }
 
+#ifdef BMA_EXEC_ENABLED
+    // Prepare src/dst pointers for batched DMA executor
+    rss.batchDsts.clear();
+    rss.batchSrcs.clear();
+    rss.batchBytes.clear();
+    if (transfer.exeDevice.exeType == EXE_GPU_BDMA) {
+      for (int i = 0; i < transfer.numSubExecs; ++i) {
+        for (int j = 0; j < (int)rss.dstMem.size(); j++) {
+          rss.batchSrcs.push_back(subExecParam[i].src[0]);
+          rss.batchDsts.push_back(subExecParam[i].dst[j]);
+          rss.batchBytes.push_back(subExecParam[i].N * sizeof(float));
+        }
+      }
+    }
+#endif
+
     // Clear counters
     rss.totalDurationMsec = 0.0;
 
+    return ERR_NONE;
+  }
+
+  static ErrResult ExchangeMemory(MemDevice const& memDevice, ExeDevice const& exeDevice, size_t* pActualBytes,
+                                  float** memPtr, hipMemGenericAllocationHandle_t* memHandle)
+  {
+    // Pass this pointer to all ranks (Used for pointer arithmetic, not defererenced on non-local ranks)
+    // NOTE: This will be overwritten on executor rank if pod communication is required
+    System::Get().Broadcast(memDevice.memRank, sizeof(*memPtr), memPtr);
+
+    // Broadcast actualBytes from owning rank so importing rank gets the correct (rounded-up) size
+    System::Get().Broadcast(memDevice.memRank, sizeof(*pActualBytes), pActualBytes);
+
+    // If pod communication is required, export/import fabric handle
+    if (memDevice.memRank != exeDevice.exeRank && IsGpuExeType(exeDevice.exeType)) {
+#ifdef POD_COMM_ENABLED
+      // mem rank exports to shareable fabric handle; broadcast handle + status so all
+      // ranks fail together instead of hanging on the next collective if export fails
+      hipMemFabricHandle_t fabricHandle = {};
+      hipError_t exportErr = hipSuccess;
+      const char* exportStep = "hipSetDevice";
+      if (memDevice.memRank == GetRank()) {
+        exportErr = hipSetDevice(memDevice.memIndex);
+        if (exportErr == hipSuccess) {
+          exportStep = "hipMemExportToShareableHandle";
+          exportErr = hipMemExportToShareableHandle(&fabricHandle, *memHandle, hipMemHandleTypeFabric, 0);
+        }
+      }
+
+      System::Get().Broadcast(memDevice.memRank, sizeof(hipMemFabricHandle_t), &fabricHandle);
+      System::Get().Broadcast(memDevice.memRank, sizeof(hipError_t), &exportErr);
+      if (exportErr != hipSuccess) {
+        return {ERR_FATAL, "HIP Error in %s during fabric handle export: %s", exportStep, hipGetErrorString(exportErr)};
+      }
+
+      // exe rank imports the fabric handle; broadcast result so all ranks fail together
+      hipError_t importErr = hipSuccess;
+      const char* importStep = "hipSetDevice";
+      if (exeDevice.exeRank == GetRank()) {
+        importErr = hipSetDevice(exeDevice.exeIndex);
+        if (importErr == hipSuccess) {
+          importStep = "hipMemImportFromShareableHandle";
+          importErr = hipMemImportFromShareableHandle(memHandle, (void*)&fabricHandle, hipMemHandleTypeFabric);
+        }
+        if (importErr == hipSuccess) {
+          importStep = "hipMemAddressReserve";
+          importErr = hipMemAddressReserve((gpu_device_ptr*)memPtr, *pActualBytes, 0, 0, 0);
+        }
+        if (importErr == hipSuccess) {
+          importStep = "hipMemMap";
+          importErr = hipMemMap((gpu_device_ptr)*memPtr, *pActualBytes, 0, *memHandle, 0);
+        }
+        if (importErr == hipSuccess) {
+          importStep = "hipMemSetAccess";
+          hipMemAccessDesc desc;
+          desc.location = {hipMemLocationTypeDevice, exeDevice.exeIndex};
+          desc.flags = hipMemAccessFlagsProtReadWrite;
+          importErr = hipMemSetAccess((gpu_device_ptr)*memPtr, *pActualBytes, &desc, 1);
+        }
+      }
+      System::Get().Broadcast(exeDevice.exeRank, sizeof(hipError_t), &importErr);
+      if (importErr != hipSuccess) {
+        return {ERR_FATAL, "HIP Error in %s during fabric handle import: %s", importStep, hipGetErrorString(importErr)};
+      }
+#else
+      return {ERR_FATAL, "Unable to export/import fabric handle without compiling with pod communication support"};
+#endif
+    }
     return ERR_NONE;
   }
 
@@ -3554,8 +4019,8 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     exeInfo.totalDurationMsec = 0.0;
     int const localRank = GetRank();
     if (System::Get().IsVerbose()) {
-      printf("[INFO] Rank %d preparing executor (%c%d on Rank %d)\n",
-             localRank, ExeTypeStr[exeDevice.exeType], exeDevice.exeIndex, exeDevice.exeRank);
+      System::Get().Log("[INFO] Rank %d preparing executor (%c%d on Rank %d)\n",
+                        localRank, ExeTypeStr[exeDevice.exeType], exeDevice.exeIndex, exeDevice.exeRank);
     }
 
     // Loop over each transfer this executor is involved in
@@ -3564,12 +4029,14 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       rss.numBytes = t.numBytes;
 
       if (System::Get().IsVerbose()) {
-        printf("[INFO] Rank %d preparing transfer %d (%lu SRC %lu DST)\n",
-               localRank, rss.transferIdx, t.srcs.size(), t.dsts.size());
+        System::Get().Log("[INFO] Rank %d preparing transfer %d (%lu SRC %lu DST)\n",
+                          localRank, rss.transferIdx, t.srcs.size(), t.dsts.size());
       }
 
       // Allocate source memory
       rss.srcMem.resize(t.srcs.size());
+      rss.srcActualBytes.resize(t.srcs.size());
+      rss.srcMemHandle.resize(t.srcs.size(), NULL);
       for (int iSrc = 0; iSrc < t.srcs.size(); ++iSrc) {
         MemDevice const& srcMemDevice = t.srcs[iSrc];
 
@@ -3584,16 +4051,21 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         }
 
         // Allocate source memory (on the correct rank)
+        bool requiresFabricHandle = (srcMemDevice.memRank != exeDevice.exeRank) && IsGpuExeType(exeDevice.exeType);
         if (srcMemDevice.memRank == localRank) {
-          ERR_CHECK(AllocateMemory(srcMemDevice, t.numBytes + cfg.data.byteOffset, (void**)&rss.srcMem[iSrc]));
+          ERR_CHECK(AllocateMemory(srcMemDevice, t.numBytes + cfg.data.byteOffset, (void**)&rss.srcMem[iSrc],
+                                   &rss.srcActualBytes[iSrc], requiresFabricHandle ? &rss.srcMemHandle[iSrc] : nullptr));
         }
 
-        // Pass this pointer to all ranks (Used for pointer arithmetic, not defererenced on non-local ranks)
-        System::Get().Broadcast(srcMemDevice.memRank, sizeof(rss.srcMem[iSrc]), &rss.srcMem[iSrc]);
+        // Exchange memory pointer across ranks
+        ERR_CHECK(ExchangeMemory(srcMemDevice, exeDevice, &rss.srcActualBytes[iSrc],
+                                 &rss.srcMem[iSrc], &rss.srcMemHandle[iSrc]));
       }
 
       // Allocate destination memory
       rss.dstMem.resize(t.dsts.size());
+      rss.dstActualBytes.resize(t.dsts.size());
+      rss.dstMemHandle.resize(t.dsts.size(), NULL);
       for (int iDst = 0; iDst < t.dsts.size(); ++iDst) {
         MemDevice const& dstMemDevice = t.dsts[iDst];
 
@@ -3607,11 +4079,15 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         }
 
         // Allocate destination memory (on the correct rank)
+        bool requiresFabricHandle = (dstMemDevice.memRank != exeDevice.exeRank) && IsGpuExeType(exeDevice.exeType);
         if (dstMemDevice.memRank == localRank) {
-          ERR_CHECK(AllocateMemory(dstMemDevice, t.numBytes + cfg.data.byteOffset, (void**)&rss.dstMem[iDst]));
+          ERR_CHECK(AllocateMemory(dstMemDevice, t.numBytes + cfg.data.byteOffset, (void**)&rss.dstMem[iDst],
+                                   &rss.dstActualBytes[iDst], requiresFabricHandle ? &rss.dstMemHandle[iDst] : NULL));
         }
-        // Pass this pointer to all ranks (Used for pointer arithmetic, not defererenced on non-local ranks)
-        System::Get().Broadcast(dstMemDevice.memRank, sizeof(rss.dstMem[iDst]), &rss.dstMem[iDst]);
+
+        // Exchange memory pointer across ranks
+        ERR_CHECK(ExchangeMemory(dstMemDevice, exeDevice, &rss.dstActualBytes[iDst],
+                                 &rss.dstMem[iDst], &rss.dstMemHandle[iDst]));
       }
 
       // Prepare HSA DMA copy specific resources
@@ -3620,8 +4096,12 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         // Collect HSA agent information
         hsa_amd_pointer_info_t info;
         info.size = sizeof(info);
-        ERR_CHECK(hsa_amd_pointer_info(rss.dstMem[0], &info, NULL, NULL, NULL));
-        rss.dstAgent = info.agentOwner;
+        int numDst = (int)rss.dstMem.size();
+        rss.dstAgent.resize(numDst);
+        for (int dstIdx = 0; dstIdx < numDst; dstIdx++) {
+          ERR_CHECK(hsa_amd_pointer_info(rss.dstMem[dstIdx], &info, NULL, NULL, NULL));
+          rss.dstAgent[dstIdx] = info.agentOwner;
+        }
 
         ERR_CHECK(hsa_amd_pointer_info(rss.srcMem[0], &info, NULL, NULL, NULL));
         rss.srcAgent = info.agentOwner;
@@ -3639,11 +4119,12 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     }
 
     // Prepare additional requirements for GPU-based executors
-    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA) && exeDevice.exeRank == localRank) {
+    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA)
+        && exeDevice.exeRank == localRank) {
       ERR_CHECK(hipSetDevice(exeDevice.exeIndex));
 
       // Determine how many streams to use
-      int const numStreamsToUse = (exeDevice.exeType == EXE_GPU_DMA ||
+      int const numStreamsToUse = (exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA ||
                                   (exeDevice.exeType == EXE_GPU_GFX && cfg.gfx.useMultiStream))
                                   ? exeInfo.resources.size() : 1;
       exeInfo.streams.resize(numStreamsToUse);
@@ -3757,6 +4238,22 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       return {ERR_FATAL, "RDMA executor is not supported"};
 #endif
     }
+
+    // Check that GPU wallclock rate is non-zero
+    if (exeDevice.exeType == EXE_GPU_GFX && exeInfo.wallClockRate == 0) {
+      if (getenv("TB_WALLCLOCK_RATE")) {
+        exeInfo.wallClockRate = atoi(getenv("TB_WALLCLOCK_RATE"));
+        return {ERR_WARN,
+          "GPU %d wallclock rate query returned 0 unexpectedly.  Setting to %d instead as specified by TB_WALLCLOCK_RATE",
+          exeDevice.exeIndex, exeInfo.wallClockRate};
+      } else {
+        exeInfo.wallClockRate = 100000;
+        return {ERR_WARN,
+          "GPU %d wallclock rate query returned 0 unexpectedly.  Setting to %d instead.  Use TB_WALLCLOCK_RATE to customize",
+          exeDevice.exeIndex, exeInfo.wallClockRate};
+      }
+    }
+
     return ERR_NONE;
   }
 
@@ -3778,14 +4275,34 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       // Deallocate source memory
       for (int iSrc = 0; iSrc < t.srcs.size(); ++iSrc) {
         if (t.srcs[iSrc].memRank == localRank) {
-          ERR_CHECK(DeallocateMemory(t.srcs[iSrc].memType, rss.srcMem[iSrc], t.numBytes + cfg.data.byteOffset));
+          ERR_CHECK(hipSetDevice(t.srcs[iSrc].memIndex));
+          ERR_CHECK(DeallocateMemory(t.srcs[iSrc].memType, rss.srcMem[iSrc],
+                                     rss.srcActualBytes[iSrc],
+                                     &rss.srcMemHandle[iSrc]));
+        } else if (exeDevice.exeRank == localRank && rss.srcMemHandle[iSrc] != 0) {
+#ifdef POD_COMM_ENABLED
+          ERR_CHECK(hipSetDevice(exeDevice.exeIndex));
+          ERR_CHECK(hipMemUnmap((gpu_device_ptr)rss.srcMem[iSrc], rss.srcActualBytes[iSrc]));
+          ERR_CHECK(hipMemRelease(rss.srcMemHandle[iSrc]));
+          ERR_CHECK(hipMemAddressFree((gpu_device_ptr)rss.srcMem[iSrc], rss.srcActualBytes[iSrc]));
+#endif
         }
       }
 
       // Deallocate destination memory
       for (int iDst = 0; iDst < t.dsts.size(); ++iDst) {
         if (t.dsts[iDst].memRank == localRank) {
-          ERR_CHECK(DeallocateMemory(t.dsts[iDst].memType, rss.dstMem[iDst], t.numBytes + cfg.data.byteOffset));
+          ERR_CHECK(hipSetDevice(t.dsts[iDst].memIndex));
+          ERR_CHECK(DeallocateMemory(t.dsts[iDst].memType, rss.dstMem[iDst],
+                                     rss.dstActualBytes[iDst],
+                                     &rss.dstMemHandle[iDst]));
+        } else if (exeDevice.exeRank == localRank && rss.dstMemHandle[iDst] != 0) {
+#ifdef POD_COMM_ENABLED
+          ERR_CHECK(hipSetDevice(exeDevice.exeIndex));
+          ERR_CHECK(hipMemUnmap((gpu_device_ptr)rss.dstMem[iDst], rss.dstActualBytes[iDst]));
+          ERR_CHECK(hipMemRelease(rss.dstMemHandle[iDst]));
+          ERR_CHECK(hipMemAddressFree((gpu_device_ptr)rss.dstMem[iDst], rss.dstActualBytes[iDst]));
+#endif
         }
       }
 
@@ -3805,7 +4322,8 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     }
 
     // Teardown additional requirements for GPU-based executors
-    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA) && exeDevice.exeRank == localRank) {
+    if ((exeDevice.exeType == EXE_GPU_GFX || exeDevice.exeType == EXE_GPU_DMA || exeDevice.exeType == EXE_GPU_BDMA)
+        && exeDevice.exeRank == localRank) {
       for (auto stream : exeInfo.streams)
         ERR_CHECK(hipStreamDestroy(stream));
       if (cfg.gfx.useHipEvents || cfg.dma.useHipEvents) {
@@ -3855,7 +4373,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 
           // Add a dummy check to ensure the read is not optimized out
           if (sum != sum) {
-            printf("[ERROR] Nan detected\n");
+            System::Get().Log("[ERROR] Nan detected\n");
           }
         } else {
           for (int i = 0; i < numDsts; ++i)
@@ -3977,18 +4495,24 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       }
       // poll for completions
       size_t completedTransfers = 0;
+      int pollBatch = std::max(1, cfg.nic.cqPollBatch);
+      std::vector<ibv_wc> wc((size_t)pollBatch);
+      ibv_wc* wc_array = wc.data();
       while (completedTransfers < transferCount) {
         for (auto i = 0; i < transferCount; i++) {
           if(receivedQPs[i] < exeInfo.resources[i].qpCount) {
             auto& rss = exeInfo.resources[i];
             // Poll the completion queue until all queue pairs are complete
             // The order of completion doesn't matter because this completion queue is dedicated to this Transfer
-            ibv_wc wc;
-            int nc = ibv_poll_cq(rss.srcIsExeNic ? rss.srcCompQueue : rss.dstCompQueue, 1, &wc);
+            // Use batch polling to drain multiple completions at once for better efficiency
+            int nc = ibv_poll_cq(rss.srcIsExeNic ? rss.srcCompQueue : rss.dstCompQueue, pollBatch, wc_array);
             if (nc > 0) {
-              receivedQPs[i]++;
-              if (wc.status != IBV_WC_SUCCESS) {
-                return {ERR_FATAL, "Transfer %d: Received unsuccessful work completion [status code %d]", rss.transferIdx, wc.status};
+              // Process all completions in the batch
+              for (int j = 0; j < nc; j++) {
+                if (wc_array[j].status != IBV_WC_SUCCESS) {
+                  return {ERR_FATAL, "Transfer %d: Received unsuccessful work completion [status code %d]", rss.transferIdx, wc_array[j].status};
+                }
+                receivedQPs[i]++;
               }
             } else if (nc < 0) {
               return {ERR_FATAL, "Transfer %d: Received negative work completion", rss.transferIdx};
@@ -4333,15 +4857,23 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
    GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, float2), \
    GPU_KERNEL_TEMPORAL_DECL(LAUNCH_BOUND, UNROLL, float4)}
 
-#define GPU_KERNEL_UNROLL_DECL(LAUNCH_BOUND)    \
-  {GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 1),      \
-   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 2),      \
-   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 3),      \
-   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 4),      \
-   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 5),      \
-   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 6),      \
-   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 7),      \
-   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 8)}
+#define GPU_KERNEL_UNROLL_DECL(LAUNCH_BOUND) \
+  {GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  1),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  2),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  3),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  4),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  5),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  6),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  7),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  8),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND,  9),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 10),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 11),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 12),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 13),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 14),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 15),  \
+   GPU_KERNEL_DWORD_DECL(LAUNCH_BOUND, 16)}
 
   // Table of all GPU Reduction kernel functions (templated blocksize / unroll / dword size / temporal)
   typedef void (*GpuKernelFuncPtr)(SubExecParam*, int, int, int);
@@ -4358,7 +4890,6 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   #undef GPU_KERNEL_UNROLL_DECL
   #undef GPU_KERNEL_DWORD_DECL
   #undef GPU_KERNEL_TEMPORAL_DECL
-  #undef GPU_KERNEL_SE_TYPE_DECL
 
   // Execute a single GPU Transfer (when using 1 stream per Transfer)
   static ErrResult ExecuteGpuTransfer(int           const  iteration,
@@ -4529,6 +5060,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   // Execute a single DMA Transfer
   static ErrResult ExecuteDmaTransfer(int           const  iteration,
                                       bool          const  useSubIndices,
+                                      int           const  exeIndex,
                                       hipStream_t   const  stream,
                                       hipEvent_t    const  startEvent,
                                       hipEvent_t    const  stopEvent,
@@ -4537,15 +5069,31 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   {
     auto cpuStart = std::chrono::high_resolution_clock::now();
 
+    int numDsts = (int)resources.dstMem.size();
+    ERR_CHECK(hipSetDevice(exeIndex));
     int subIterations = 0;
     if (!useSubIndices && !cfg.dma.useHsaCopy) {
       if (cfg.dma.useHipEvents)
         ERR_CHECK(hipEventRecord(startEvent, stream));
 
-      // Use hipMemcpy
+      // Force the use of SDMA engine if possible
+#if defined(__HIP_PLATFORM_AMD__) && defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >= 6)
+      hipMemcpyKind memcpyKind = hipMemcpyDeviceToDeviceNoCU;
+#endif
+
+      // Use DMA copy engine
       do {
-        ERR_CHECK(hipMemcpyAsync(resources.dstMem[0], resources.srcMem[0], resources.numBytes,
-                                 hipMemcpyDefault, stream));
+        // Queue for each output location
+        for (int dstIdx = 0; dstIdx < numDsts; dstIdx++) {
+#if defined(__NVCC__)
+          ERR_CHECK(cuMemcpyAsync((CUdeviceptr)resources.dstMem[dstIdx],
+                                  (CUdeviceptr)resources.srcMem[0],
+                                  resources.numBytes, stream));
+#else
+          ERR_CHECK(hipMemcpyAsync(resources.dstMem[dstIdx], resources.srcMem[0], resources.numBytes,
+                                   memcpyKind, stream));
+#endif
+        }
       } while (++subIterations != cfg.general.numSubIterations);
 
       if (cfg.dma.useHipEvents)
@@ -4557,20 +5105,22 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #else
       // Use HSA async copy
       do {
-        hsa_signal_store_screlease(resources.signal, 1);
-        if (!useSubIndices) {
-          ERR_CHECK(hsa_amd_memory_async_copy(resources.dstMem[0], resources.dstAgent,
-                                              resources.srcMem[0], resources.srcAgent,
-                                              resources.numBytes, 0, NULL,
-                                              resources.signal));
-        } else {
-          HSA_CALL(hsa_amd_memory_async_copy_on_engine(resources.dstMem[0], resources.dstAgent,
-                                                       resources.srcMem[0], resources.srcAgent,
-                                                       resources.numBytes, 0, NULL,
-                                                       resources.signal,
-                                                       resources.sdmaEngineId, true));
+        hsa_signal_store_screlease(resources.signal, numDsts);
+        for (int dstIdx = 0; dstIdx < numDsts; dstIdx++) {
+          if (!useSubIndices) {
+            ERR_CHECK(hsa_amd_memory_async_copy(resources.dstMem[dstIdx], resources.dstAgent[dstIdx],
+                                                resources.srcMem[0], resources.srcAgent,
+                                                resources.numBytes, 0, NULL,
+                                                resources.signal));
+          } else {
+            HSA_CALL(hsa_amd_memory_async_copy_on_engine(resources.dstMem[dstIdx], resources.dstAgent[dstIdx],
+                                                         resources.srcMem[0], resources.srcAgent,
+                                                         resources.numBytes, 0, NULL,
+                                                         resources.signal,
+                                                         resources.sdmaEngineId, true));
+          }
         }
-        // Wait for SDMA transfer to complete
+        // Wait for SDMA transfer(s) to complete
         while(hsa_signal_wait_scacquire(resources.signal,
                                         HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX,
                                         HSA_WAIT_STATE_ACTIVE) >= 1);
@@ -4609,6 +5159,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
                                              ExecuteDmaTransfer,
                                              iteration,
                                              exeInfo.useSubIndices,
+                                             exeIndex,
                                              exeInfo.streams[i],
                                              cfg.dma.useHipEvents ? exeInfo.startEvents[i] : NULL,
                                              cfg.dma.useHipEvents ? exeInfo.stopEvents[i]  : NULL,
@@ -4626,6 +5177,93 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     return ERR_NONE;
   }
 
+// BMA Executor-related functions
+//========================================================================================
+#ifdef BMA_EXEC_ENABLED
+  // Execute a single BMA Transfer (one hipMemcpyBatchAsync per sub-iteration; each subexecutor is one batch entry)
+  static ErrResult ExecuteBatchDmaTransfer(int           const  iteration,
+                                           int           const  exeIndex,
+                                           hipStream_t   const  stream,
+                                           hipEvent_t    const  startEvent,
+                                           hipEvent_t    const  stopEvent,
+                                           ConfigOptions const& cfg,
+                                           TransferResources&   resources)
+  {
+    auto cpuStart = std::chrono::high_resolution_clock::now();
+
+    ERR_CHECK(hipSetDevice(exeIndex));
+
+    int subIterations = 0;
+    if (cfg.dma.useHipEvents)
+      ERR_CHECK(hipEventRecord(startEvent, stream));
+
+    [[maybe_unused]] size_t failIdx = 0;
+    do {
+      ERR_CHECK(hipMemcpyBatchAsync(resources.batchDsts.data(),
+                                    resources.batchSrcs.data(),
+                                    resources.batchBytes.data(),
+                                    resources.batchDsts.size(),
+                                    nullptr, nullptr, 0,
+    // In CUDA 13.0 the failIdx argument was removed from the original CUDA 12.8 API call
+#if !defined(__NVCC__) || (defined(CUDA_VERSION) && (CUDA_VERSION < 13000))
+                                    &failIdx,
+#endif
+                                    stream));
+    } while (++subIterations != cfg.general.numSubIterations);
+
+    if (cfg.dma.useHipEvents)
+      ERR_CHECK(hipEventRecord(stopEvent, stream));
+    ERR_CHECK(hipStreamSynchronize(stream));
+
+    auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
+    double cpuDeltaMsec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0 / cfg.general.numSubIterations;
+
+    if (iteration >= 0) {
+      double deltaMsec = cpuDeltaMsec;
+      if (cfg.dma.useHipEvents) {
+        float gpuDeltaMsec;
+        ERR_CHECK(hipEventElapsedTime(&gpuDeltaMsec, startEvent, stopEvent));
+        deltaMsec = gpuDeltaMsec / cfg.general.numSubIterations;
+      }
+      resources.totalDurationMsec += deltaMsec;
+      if (cfg.general.recordPerIteration)
+        resources.perIterMsec.push_back(deltaMsec);
+    }
+    return ERR_NONE;
+  }
+
+  static ErrResult RunBmaExecutor(int           const  iteration,
+                                  ConfigOptions const& cfg,
+                                  int           const  exeIndex,
+                                  ExeInfo&             exeInfo)
+  {
+    auto cpuStart = std::chrono::high_resolution_clock::now();
+    ERR_CHECK(hipSetDevice(exeIndex));
+
+    vector<std::future<ErrResult>> asyncTransfers;
+    for (int i = 0; i < exeInfo.resources.size(); i++) {
+      asyncTransfers.emplace_back(std::async(std::launch::async,
+                                             ExecuteBatchDmaTransfer,
+                                             iteration,
+                                             exeIndex,
+                                             exeInfo.streams[i],
+                                             cfg.dma.useHipEvents ? exeInfo.startEvents[i] : NULL,
+                                             cfg.dma.useHipEvents ? exeInfo.stopEvents[i]  : NULL,
+                                             std::cref(cfg),
+                                             std::ref(exeInfo.resources[i])));
+    }
+
+    for (auto& asyncTransfer : asyncTransfers)
+      ERR_CHECK(asyncTransfer.get());
+
+    auto cpuDelta = std::chrono::high_resolution_clock::now() - cpuStart;
+    double deltaMsec = std::chrono::duration_cast<std::chrono::duration<double>>(cpuDelta).count() * 1000.0 / cfg.general.numSubIterations;
+    if (iteration >= 0)
+      exeInfo.totalDurationMsec += deltaMsec;
+    return ERR_NONE;
+  }
+#endif // BMA_EXEC_ENABLED
+
 // Executor-related functions
 //========================================================================================
   static ErrResult RunExecutor(int           const  iteration,
@@ -4634,15 +5272,31 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
                                ExeInfo&             exeInfo)
   {
     switch (exeDevice.exeType) {
-    case EXE_CPU:     return RunCpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
-    case EXE_GPU_GFX: return RunGpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
-    case EXE_GPU_DMA: return RunDmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+    case EXE_CPU:           return RunCpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+    case EXE_GPU_GFX:       return RunGpuExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+    case EXE_GPU_DMA:       return RunDmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
 #ifdef NIC_EXEC_ENABLED
-    case EXE_NIC:     return RunNicExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+    case EXE_NIC:           return RunNicExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
 #endif
-    default:          return {ERR_FATAL, "Unsupported executor (%d)", exeDevice.exeType};
+#ifdef BMA_EXEC_ENABLED
+    case EXE_GPU_BDMA: return RunBmaExecutor(iteration, cfg, exeDevice.exeIndex, exeInfo);
+#endif
+    default:            return {ERR_FATAL, "Unsupported executor (%d)", exeDevice.exeType};
     }
   }
+
+#if defined(__NVCC__)
+  static bool MnnvlCheck() {
+    int flag = 0;
+#ifdef POD_COMM_ENABLED
+    CUresult err = cuDeviceGetAttribute(&flag, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, 0);
+    if (err || !flag) return false;
+    err = cuDeviceGetAttribute(&flag, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, 0);
+#endif
+    if (!flag) return false;
+    return true;
+  }
+#endif
 
 } // End of anonymous namespace
 //========================================================================================
@@ -4661,7 +5315,22 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     }
   }
 
-#if !defined(__NVCC__)
+#if defined(__NVCC__)
+  ErrResult::ErrResult(CUresult err)
+  {
+    if (err == CUDA_SUCCESS) {
+      this->errType = ERR_NONE;
+      this->errMsg  = "";
+    } else {
+      const char *errString = NULL, *errName = NULL;
+      cuGetErrorName(err, &errName);
+      cuGetErrorString(err, &errString);
+      this->errType = ERR_FATAL;
+      this->errMsg  = std::string("CUDA Driver Error: ") + errName
+                      + " (" + errString + ")";
+    }
+  }
+#else
   ErrResult::ErrResult(hsa_status_t err)
   {
     if (err == HSA_STATUS_SUCCESS) {
@@ -4714,6 +5383,9 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       System::Get().AllGatherErrors(errResults);
       return false;
     }
+
+    // Log transfers (if requested)
+    System::Get().LogTransfers(transfers);
 
     // Collect up transfers by executor
     int minNumSrcs = MAX_SRCS + 1;
@@ -4782,6 +5454,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         Transfer const& t = transfers[resource->transferIdx];
         for (int srcIdx = 0; srcIdx < resource->srcMem.size(); srcIdx++) {
           if (t.srcs[srcIdx].memRank == localRank) {
+            ERR_APPEND(hipSetDevice(t.srcs[srcIdx].memIndex), errResults);
             ERR_APPEND(hipMemcpy(resource->srcMem[srcIdx] + initOffset, srcReference[srcIdx].data(), resource->numBytes,
                                  hipMemcpyDefault), errResults);
           }
@@ -4792,22 +5465,22 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     // Pause before starting when running in iteractive mode
     if (cfg.general.useInteractive) {
       if (localRank == 0) {
-        printf("Memory prepared:\n");
+        System::Get().Log("Memory prepared:\n");
 
         for (int i = 0; i < transfers.size(); i++) {
-          printf("Transfer %03d:\n", i);
+          System::Get().Log("Transfer %03d:\n", i);
           for (int iSrc = 0; iSrc < transfers[i].srcs.size(); ++iSrc)
-            printf("  SRC %0d: %p\n", iSrc, transferResources[i]->srcMem[iSrc]);
+            System::Get().Log("  SRC %0d: %p\n", iSrc, transferResources[i]->srcMem[iSrc]);
           for (int iDst = 0; iDst < transfers[i].dsts.size(); ++iDst)
-            printf("  DST %0d: %p\n", iDst, transferResources[i]->dstMem[iDst]);
+            System::Get().Log("  DST %0d: %p\n", iDst, transferResources[i]->dstMem[iDst]);
         }
-        printf("Hit <Enter> to continue: ");
+        System::Get().Log("Hit <Enter> to continue: ");
         fflush(stdout);
         if (scanf("%*c") != 0) {
-          printf("[ERROR] Unexpected input\n");
+          System::Get().Log("[ERROR] Unexpected input\n");
           exit(1);
         }
-        printf("\n");
+        System::Get().Log("\n");
       }
       System::Get().Barrier();
     }
@@ -4866,12 +5539,12 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     // Pause for interactive mode
     if (cfg.general.useInteractive) {
       if (localRank == 0) {
-        printf("Transfers complete. Hit <Enter> to continue: ");
+        System::Get().Log("Transfers complete. Hit <Enter> to continue: ");
         if (scanf("%*c") != 0)  {
-          printf("[ERROR] Unexpected input\n");
+          System::Get().Log("[ERROR] Unexpected input\n");
           exit(1);
         }
-        printf("\n");
+        System::Get().Log("\n");
         fflush(stdout);
       }
       System::Get().Barrier();
@@ -5013,14 +5686,14 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         }
         // At this point, there should be only 1 (valid) rank assigned to this SRC
         if (wc.mem[isDst][iMem].memRanks.size() != 1 || wc.mem[isDst][iMem].memRanks[0] < 0) {
-          printf("[ERROR] Unexpected number of ranks / invalid number of ranks for %s %d\n", isDst ? "DST" : "SRC", iMem);
+          System::Get().Log("[ERROR] Unexpected number of ranks / invalid number of ranks for %s %d\n", isDst ? "DST" : "SRC", iMem);
           exit(1);
         }
 
         // Resolve mem index wildcards
         // Mem devices should have at least one index
         if (wc.mem[isDst][iMem].memIndices.size() == 0) {
-          printf("[ERROR] MemIndex for %s %d cannot be empty\n", isDst ? "DST" : "SRC", iMem);
+          System::Get().Log("[ERROR] MemIndex for %s %d cannot be empty\n", isDst ? "DST" : "SRC", iMem);
           exit(1);
         }
 
@@ -5109,13 +5782,13 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       wc.exe.exeRanks.swap(exeRanks);
       return result;
     } else if (wc.exe.exeRanks[0] == -1) {
-      printf("[ERROR] Exe rank should not be -1\n");
+      System::Get().Log("[ERROR] Exe rank should not be -1\n");
       exit(1);
     }
 
     // Resolve EXE indices
     if (wc.exe.exeIndices.size() == 0) {
-      printf("[ERROR] Exe index should never be empty\n");
+      System::Get().Log("[ERROR] Exe index should never be empty\n");
       exit(1);
     } else if (wc.exe.exeIndices.size() > 1) {
       // Loop over user provided indices
@@ -5179,7 +5852,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         wc.exe.exeSubIndices.clear();
         return result;
       } else if (wc.exe.exeType == EXE_NIC) {
-        printf("[ERROR] NIC executor requires a subindex be specified\n");
+        System::Get().Log("[ERROR] NIC executor requires a subindex be specified\n");
         exit(1);
       } else if (wc.exe.exeType == EXE_NIC_NEAREST) {
         // Assign NIC closest to DST mem
@@ -5213,7 +5886,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         result |= RecursiveWildcardTransferExpansion(wc, baseRankIndex, numBytes, numSubExecs, transfers);
         wc.exe.exeSubIndices[0] = -2;
         return result;
-      case EXE_GPU_GFX: case EXE_GPU_DMA:
+      case EXE_GPU_GFX: case EXE_GPU_DMA: case EXE_GPU_BDMA:
       {
         // Iterate over all available subindices
         ExeDevice exeDevice = {wc.exe.exeType, wc.exe.exeIndices[0], wc.exe.exeRanks[0], 0};
@@ -5381,13 +6054,37 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   System::System() :
     rank(0), numRanks(1), commMode(COMM_NONE)
   {
+    // Collect env vars
+    // TB_VERBOSE       = enables extra logging
+    // TB_SINGLE_LOG    = Only rank 0 will produce output (useful if spawning multi-node socket)
+    // TB_DUMP_CFG_FILE = Config file to dump executed Transfers
+    // TB_PAUSE         = Insert a pause for debug attachment
+
     verbose = getenv("TB_VERBOSE") ? atoi(getenv("TB_VERBOSE")) : 0;
+    bool singleLog = getenv("TB_SINGLE_LOG") ? atoi(getenv("TB_SINGLE_LOG")) : 0;
+
+    char* dumpCfgFilename = getenv("TB_DUMP_CFG_FILE");
+    if (dumpCfgFilename) {
+      dumpCfgFile = fopen(dumpCfgFilename, "w");
+    }
 
     if (getenv("TB_PAUSE")) {
-      printf("Pausing for debug attachment\n");
+      Log("Pausing for debug attachment (e.g. sudo gdb -p %d)\n", getpid());
       volatile bool pause = true;
       while (pause);
     }
+
+#ifdef AMD_SMI_ENABLED
+    if (verbose) {
+      Log("[INFO] Initializing AMD System Management Interface Library (AMDSMI)\n");
+    }
+    amdsmi_init(AMDSMI_INIT_AMD_APUS);
+#elif defined (NVML_ENABLED)
+    if (verbose) {
+      Log("[INFO] Initializing NVIDIA Management Library (NVML)\n");
+    }
+    nvmlInit_v2();
+#endif
 
     // Priority 1: Socket communicator
     SetupSocketCommunicator();
@@ -5397,8 +6094,12 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       SetupMpiCommunicator();
     }
 
+    // Establish which ranks will output when logging
+    if (rank > 0 && (commMode == COMM_MPI || singleLog))
+      rankDoesOutput = false;
+
     if (verbose && commMode == COMM_NONE) {
-      printf("[INFO] Running in single node mode\n");
+      Log("[INFO] Running in single node mode\n");
     }
 
     // Collect topology and distribute across all ranks
@@ -5428,6 +6129,16 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         listenSocket = -1;
       }
     }
+
+    if (dumpCfgFile) {
+      fclose(dumpCfgFile);
+    }
+
+#ifdef AMD_SMI_ENABLED
+    amdsmi_shut_down();
+#elif defined(__NVCC__) && defined(POD_COMM_ENABLED)
+    nvmlShutdown();
+#endif
   }
 
   void System::SetupSocketCommunicator()
@@ -5440,7 +6151,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     // Socket communicator requires rank / numRanks / masterAddr
     if (!rankStr || !numRanksStr || !masterAddrStr) {
       if (verbose) {
-        printf("[INFO] SocketCommunicator skipped due to missing TB_RANK | TB_NUM_RANKS | TB_MASTER_ADDR\n");
+        Log("[INFO] SocketCommunicator skipped due to missing TB_RANK | TB_NUM_RANKS | TB_MASTER_ADDR\n");
       }
       return;
     }
@@ -5451,7 +6162,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     masterPort = masterPortStr ? atoi(masterPortStr) : 29500;
 
     if (rank < 0 || rank >= numRanks) {
-      printf("[ERROR] Invalid rank index.  Must be between 0 and %d (not %d)\n", numRanks - 1, rank);
+      Log("[ERROR] Invalid rank index.  Must be between 0 and %d (not %d)\n", numRanks - 1, rank);
       exit(1);
     }
 
@@ -5463,7 +6174,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       // Create listening socket
       listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
       if (listenSocket == -1) {
-        printf("[ERROR] Unable to create listener socket\n");
+        Log("[ERROR] Unable to create listener socket\n");
         exit(1);
       }
 
@@ -5478,17 +6189,17 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       serverAddr.sin_port        = htons(masterPort);
 
       if (bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
-        printf("[ERROR] Failed to bind listen socket\n");
+        Log("[ERROR] Failed to bind listen socket\n");
         exit(1);
       }
 
       if (listen(listenSocket, numRanks) == -1) {
-        printf("[ERROR] Failed to listen on socket\n");
+        Log("[ERROR] Failed to listen on socket\n");
         exit(1);
       }
       // Accept connections from other ranks
-      printf("Waiting for connections from %d other ranks [listening on TB_MASTER_ADDR=%s TB_MASTER_PORT=%d]\n",
-             numRanks-1, masterAddr.c_str(), masterPort);
+      Log("Waiting for connections from %d other ranks [listening on TB_MASTER_ADDR=%s TB_MASTER_PORT=%d]\n",
+                        numRanks-1, masterAddr.c_str(), masterPort);
 
       for (int i = 1; i < numRanks; i++) {
         sockaddr_in clientAddr;
@@ -5496,7 +6207,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 
         auto clientSocket = accept(listenSocket, (sockaddr*)&clientAddr, &clientAddrLen);
         if (clientSocket == -1) {
-          printf("[ERROR] Failed to accept connection from rank %d\n", i);
+          Log("[ERROR] Failed to accept connection from rank %d\n", i);
           exit(1);
         }
 
@@ -5506,11 +6217,11 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 
         if (clientRank < 0 || clientRank >= numRanks) {
           close(clientSocket);
-          printf("[ERROR] Invalid rank received: %d\n", clientRank);
+          Log("[ERROR] Invalid rank received: %d\n", clientRank);
           exit(1);
         }
         if (verbose) {
-          printf("[INFO] Rank 0 accepted connection from rank %d\n", clientRank);
+          Log("[INFO] Rank 0 accepted connection from rank %d\n", clientRank);
         }
         sockets[clientRank] = clientSocket;
       }
@@ -5518,7 +6229,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       // All other ranks connect to rank 0
       int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
       if (sock == -1) {
-        printf("[ERROR] Failed to create socket\n");
+        Log("[ERROR] Failed to create socket\n");
         exit(1);
       }
 
@@ -5527,20 +6238,20 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       serverAddr.sin_family = AF_INET;
       serverAddr.sin_port = htons(masterPort);
       if (inet_pton(AF_INET, masterAddr.c_str(), &serverAddr.sin_addr) <= 0) {
-        printf("[ERROR] Invalid master address: %s\n", masterAddr.c_str());
+        Log("[ERROR] Invalid master address: %s\n", masterAddr.c_str());
         exit(1);
       }
 
       // Retry connection with backoff
       if (verbose)
-        printf("[INFO] Rank %d attempting to connect to %s:%d\n", rank, masterAddrStr, masterPort);
+        Log("[INFO] Rank %d attempting to connect to %s:%d\n", rank, masterAddrStr, masterPort);
       int maxRetries = 50;
       for (int retry = 0; retry < maxRetries; retry++) {
         if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == 0) {
           break;
         }
         if (retry == maxRetries - 1) {
-          printf("[ERROR] Failed to connect to master after %d retries\n", maxRetries);
+          Log("[ERROR] Failed to connect to master after %d retries\n", maxRetries);
         }
         sleep(1);
       }
@@ -5568,7 +6279,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     MPI_Comm_size(comm, &numRanks);
     if (numRanks > 1) {
       if (verbose) {
-        printf("[INFO] Enabling MPI communicator (%d ranks found)\n", numRanks);
+        Log("[INFO] Enabling MPI communicator (%d ranks found)\n", numRanks);
       }
       commMode = COMM_MPI;
     } else if (mpiInit) {
@@ -5576,6 +6287,59 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       MPI_Finalize();
     }
 #endif
+  }
+
+  void System::Log(const char* format, ...) const
+  {
+    if (rankDoesOutput) {
+      va_list args;
+      va_start(args, format);
+      vprintf(format, args);
+      va_end(args);
+    }
+  }
+
+  void System::LogTransfers(std::vector<Transfer> const& transfers)
+  {
+    if (!dumpCfgFile || !rankDoesOutput) return;
+
+    fprintf(dumpCfgFile, "-%lu ", transfers.size());
+    for (auto const& t : transfers) {
+      fprintf(dumpCfgFile, "(");
+
+      // Print SRCs
+      for (auto const& src : t.srcs) {
+        fprintf(dumpCfgFile, "R%d%c%d", src.memRank, MemTypeStr[src.memType], src.memIndex);
+      }
+      if (t.srcs.empty())
+        fprintf(dumpCfgFile, "N");
+
+      fprintf(dumpCfgFile, "->");
+
+      // Print Executor
+      fprintf(dumpCfgFile, "R%d%c%d", t.exeDevice.exeRank, ExeTypeStr[t.exeDevice.exeType], t.exeDevice.exeIndex);
+      if (t.exeDevice.exeSlot != 0)
+        fprintf(dumpCfgFile, "%c", 'A' + t.exeDevice.exeSlot);
+      if (t.exeSubIndex != -1) {
+        fprintf(dumpCfgFile, ".%d", t.exeSubIndex);
+      }
+      if (t.exeSubSlot != 0) {
+        fprintf(dumpCfgFile, "%c", 'A' + t.exeSubSlot);
+      }
+
+      fprintf(dumpCfgFile, "->");
+
+      // Print DSTs
+      for (auto const& dst : t.dsts) {
+        fprintf(dumpCfgFile, "R%d%c%d", dst.memRank, MemTypeStr[dst.memType], dst.memIndex);
+      }
+      if (t.dsts.empty())
+        fprintf(dumpCfgFile, "N");
+
+      fprintf(dumpCfgFile, " %d %lu)", t.numSubExecs, t.numBytes);
+      fflush(dumpCfgFile);
+    }
+    fprintf(dumpCfgFile, "\n");
   }
 
   void System::Barrier()
@@ -5618,7 +6382,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #endif
     if (commMode == COMM_SOCKET) {
       if (rank != 0 && dstRank != 0) {
-        printf("[ERROR] Socket communicator is limited to sending from/to rank 0\n");
+        Log("[ERROR] Socket communicator is limited to sending from/to rank 0\n");
         exit(1);
       }
       auto sock = sockets[dstRank];
@@ -5628,7 +6392,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       while (totalSent < numBytes) {
         auto sent = send(sock, (char*)sendData + totalSent, numBytes - totalSent, 0);
         if (sent == -1) {
-          printf("[ERROR] Send failed (rank %d to rank %d)\n", rank, dstRank);
+          Log("[ERROR] Send failed (rank %d to rank %d)\n", rank, dstRank);
           exit(1);
         }
         totalSent += sent;
@@ -5647,7 +6411,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #endif
     if (commMode == COMM_SOCKET) {
       if (rank != 0 && srcRank != 0) {
-        printf("[ERROR] Socket communicator is limited to receiving from/at rank 0\n");
+        Log("[ERROR] Socket communicator is limited to receiving from/at rank 0\n");
         exit(1);
       }
 
@@ -5656,7 +6420,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       while (totalRecv < numBytes) {
         auto recvd = recv(sock, (char*)recvData + totalRecv, numBytes - totalRecv, 0);
         if (recvd == -1 || recvd == 0) {
-          printf("[ERROR] Recv failed (rank %d from rank %d)\n", rank, srcRank);
+          Log("[ERROR] Recv failed (rank %d from rank %d)\n", rank, srcRank);
           perror("recv");
           exit(1);
         }
@@ -5673,7 +6437,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     if (commMode == COMM_MPI) {
       int err = MPI_Bcast(data, numBytes, MPI_CHAR, root, comm);
       if (err != MPI_SUCCESS) {
-        printf("[ERROR] MPI_Bcast failed with error code %d\n", err);
+        Log("[ERROR] MPI_Bcast failed with error code %d\n", err);
       }
       return;
     }
@@ -5727,6 +6491,103 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     return "Unknown CPU";
   }
 
+  void System::CollectPodMembership(char* ppodId, int64_t& vpodId)
+  {
+    memset(ppodId, 0, 16);
+    vpodId = -1;
+
+    // TB_FORCE_SINGLE_POD skips any required queries to AMDSMI
+    char* forceSinglePod = getenv("TB_FORCE_SINGLE_POD");
+    if (forceSinglePod) {
+      vpodId = 0;
+      return;
+    }
+
+    // Check fabric support
+#if defined(__NVCC__)
+#ifdef NVML_ENABLED
+    if (!MnnvlCheck()) return;
+    char busId[] = "00000000:00:00.0";
+    if (cudaDeviceGetPCIBusId(busId, sizeof(busId), 0)) return;
+
+    nvmlGpuFabricInfoV_t fabricInfo;
+    fabricInfo.state = NVML_GPU_FABRIC_STATE_NOT_SUPPORTED;
+    nvmlDevice_t nvmlDev;
+    nvmlReturn_t err = nvmlDeviceGetHandleByPciBusId_v2(busId, &nvmlDev);
+    if (err != NVML_SUCCESS) {
+      if (verbose) {
+        System::Get().Log("[WARN] Unable to get processor handle for GPU 0 at %s [%s]\n",
+                           busId, nvmlErrorString(err));
+      }
+      return;
+    }
+    fabricInfo.version = nvmlGpuFabricInfo_v2;
+
+    err = nvmlDeviceGetGpuFabricInfoV(nvmlDev, &fabricInfo);
+    if (err != NVML_SUCCESS || fabricInfo.state == NVML_GPU_FABRIC_STATE_NOT_SUPPORTED) {
+      System::Get().Log("[WARN] MNNVL not supported\n");
+    } else {
+      vpodId = fabricInfo.cliqueId;
+      memcpy(ppodId, fabricInfo.clusterUuid, 16);
+    }
+#endif
+#else
+#ifdef AMD_SMI_ENABLED
+    int numGpus = 0;
+    if (hipGetDeviceCount(&numGpus) == hipSuccess && numGpus > 0) {
+      // Query GPU 0 as the representative for pod membership. All GPUs on a node are
+      // expected to share the same pod (ppod_id/vpod_id), so querying any one is sufficient.
+      char pciBusId[256] = "";
+      hipError_t hipErr = hipDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), 0);
+      if (hipErr != hipSuccess) {
+        if (verbose) {
+          Log("[WARN] Unable to get PCI bus ID for GPU 0; skipping AMD-SMI pod membership query\n");
+        }
+        return;
+      }
+
+      amdsmi_bdf_t bdf = {};
+      unsigned domain, bus, device, func;
+      if (sscanf(pciBusId, "%x:%x:%x.%x", &domain, &bus, &device, &func) != 4) {
+        if (verbose) {
+          Log("[WARN] Unable to parse PCI bus ID '%s'; skipping AMD-SMI pod membership query\n", pciBusId);
+        }
+        return;
+      }
+      bdf.domain_number   = domain;
+      bdf.bus_number      = bus;
+      bdf.device_number   = device;
+      bdf.function_number = func;
+
+      amdsmi_processor_handle gpuHandle;
+      amdsmi_status_t err = amdsmi_get_processor_handle_from_bdf(bdf, &gpuHandle);
+      if (err != AMDSMI_STATUS_SUCCESS) {
+        if (verbose) {
+          const char *errString = NULL;
+          amdsmi_status_code_to_string(err, &errString);
+          Log("[WARN] Unable to get processor handle for GPU 0 at %s [%s]\n",
+                            pciBusId, errString);
+        }
+      } else {
+        amdsmi_fabric_info_t fabricInfo;
+        err = amdsmi_get_gpu_fabric_info(gpuHandle, &fabricInfo);
+        if (err == AMDSMI_STATUS_SUCCESS) {
+          // NOTE: vpod_id is a uint32_t but System holds it as an int64_t to allow for
+          //       vpodId == -1 to represent no pod present
+          memcpy(ppodId, &fabricInfo.fabric_info.fabric_version.v1.ppod_id,
+                 sizeof(fabricInfo.fabric_info.fabric_version.v1.ppod_id));
+          vpodId = fabricInfo.fabric_info.fabric_version.v1.vpod_id;
+        } else if (verbose) {
+          const char *errString = NULL;
+          amdsmi_status_code_to_string(err, &errString);
+          Log("[WARN] Unable to get fabric info from AMD SMI [%s]\n", errString);
+        }
+      }
+    }
+#endif
+#endif
+  }
+
   void System::GetRankTopology(RankTopology& topo)
   {
     // Clear topology structure first
@@ -5743,9 +6604,8 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     char* firstDotPtr = std::strchr(topo.hostname, '.');
     if (firstDotPtr) *firstDotPtr = 0;
 
-    // NOTE: Placeholder values
-    strcpy(topo.ppodId, "N/A");
-    topo.vpodId = -1;
+    // Collect Pod membership
+    CollectPodMembership(topo.ppodId, topo.vpodId);
 
     // CPU Executor
     int numCpus = numa_num_configured_nodes();
@@ -5764,9 +6624,9 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 
     if (verbose) {
       for (int exeIndex = 0; exeIndex < numCpus; exeIndex++) {
-        printf("[INFO] Rank %03d: CPU [%02d/%02d] %03d cores (%s)\n", rank, exeIndex, numCpus,
-               topo.numSubExecutors[{EXE_CPU, exeIndex}],
-               topo.executorName[{EXE_CPU, exeIndex}].c_str());
+        Log("[INFO] Rank %03d: CPU [%02d/%02d] %03d cores (%s)\n", rank, exeIndex, numCpus,
+            topo.numSubExecutors[{EXE_CPU, exeIndex}],
+            topo.executorName[{EXE_CPU, exeIndex}].c_str());
       }
     }
 
@@ -5776,6 +6636,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     if (status != hipSuccess) numGpus = 0;
     topo.numExecutors[EXE_GPU_GFX] = numGpus;
     topo.numExecutors[EXE_GPU_DMA] = numGpus;
+    topo.numExecutors[EXE_GPU_BDMA] = numGpus;
 
     for (int exeIndex = 0; exeIndex < numGpus; exeIndex++) {
       int numDeviceCUs  = 0;
@@ -5794,6 +6655,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       }
       topo.executorName[{EXE_GPU_GFX, exeIndex}] = gpuName;
       topo.executorName[{EXE_GPU_DMA, exeIndex}] = gpuName;
+      topo.executorName[{EXE_GPU_BDMA, exeIndex}] = gpuName;
 
 #if !defined(__NVCC__)
       hsa_agent_t gpuAgent = gpuAgents[exeIndex];
@@ -5822,8 +6684,10 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #endif
       topo.numExecutorSubIndices[{EXE_GPU_GFX, exeIndex}] = numXccs;
       topo.numExecutorSubIndices[{EXE_GPU_DMA, exeIndex}] = numDmaEngines;
+      topo.numExecutorSubIndices[{EXE_GPU_BDMA, exeIndex}] = 0;
       topo.numSubExecutors[{EXE_GPU_GFX, exeIndex}] = numDeviceCUs;
       topo.numSubExecutors[{EXE_GPU_DMA, exeIndex}] = 1;
+      topo.numSubExecutors[{EXE_GPU_BDMA, exeIndex}] = numDmaEngines;
       topo.closestCpuNumaToGpu[exeIndex] = closestNuma;
       topo.closestNicsToGpu[exeIndex] = {};
     }
@@ -5837,7 +6701,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       topo.executorName[{EXE_NIC, exeIndex}] = GetIbvDeviceList()[exeIndex].name;
       topo.nicIsActive[exeIndex] = GetIbvDeviceList()[exeIndex].hasActivePort;
       if (verbose) {
-        printf("[INFO] Rank %03d: NIC [%02d/%02d] on CPU NUMA %d\n", rank, exeIndex, numNics, topo.closestCpuNumaToNic[exeIndex]);
+        Log("[INFO] Rank %03d: NIC [%02d/%02d] on CPU NUMA %d\n", rank, exeIndex, numNics, topo.closestCpuNumaToNic[exeIndex]);
       }
     }
 #endif
@@ -5883,7 +6747,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       hipError_t err = hipDeviceGetPCIBusId(hipPciBusId, sizeof(hipPciBusId), gpuIndex);
       if (err != hipSuccess) {
 #ifdef VERBS_DEBUG
-        printf("Failed to get PCI Bus ID for HIP device %d: %s\n", gpuIndex, hipGetErrorString(err));
+        Log("Failed to get PCI Bus ID for HIP device %d: %s\n", gpuIndex, hipGetErrorString(err));
 #endif
         continue;
       }
@@ -5902,7 +6766,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       // to determine the closest NIC to GPU if the PCIe tree approach fails
       if (closestIdx < 0) {
 #ifdef VERBS_DEBUG
-        printf("[WARN] Falling back to PCIe bus ID distance to determine proximity\n");
+        Log("[WARN] Falling back to PCIe bus ID distance to determine proximity\n");
 #endif
         int minDistance = std::numeric_limits<int>::max();
         for (int nicIndex = 0; nicIndex < numNics; nicIndex++) {
@@ -5972,31 +6836,31 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 
     if (verbose) {
       for (int exeIndex = 0; exeIndex < numGpus; exeIndex++) {
-        printf("[INFO] Rank %03d: GPU [%02d/%02d] %d XCCs %03d CUs on CPU NUMA %d Closest NICs:", rank, exeIndex, numGpus,
-               topo.numExecutorSubIndices[{EXE_GPU_GFX, exeIndex}],
-               topo.numSubExecutors[{EXE_GPU_GFX, exeIndex}],
-               topo.closestCpuNumaToGpu[exeIndex]);
+        Log("[INFO] Rank %03d: GPU [%02d/%02d] %d XCCs %03d CUs on CPU NUMA %d Closests NICs:", rank, exeIndex, numGpus,
+            topo.numExecutorSubIndices[{EXE_GPU_GFX, exeIndex}],
+            topo.numSubExecutors[{EXE_GPU_GFX, exeIndex}],
+            topo.closestCpuNumaToGpu[exeIndex]);
         if (topo.closestNicsToGpu[exeIndex].size() == 0) {
-          printf(" none\n");
+          Log(" none");
         } else {
           for (auto nicIndex : topo.closestNicsToGpu[exeIndex]) {
-            printf(" %d", nicIndex);
+            Log(" %d", nicIndex);
           }
-          printf("\n");
+          Log("\n");
         }
       }
 #ifdef NIC_EXEC_ENABLED
       for (int nicIndex = 0; nicIndex < numNics; nicIndex++) {
-        printf("[INFO] Rank %03d: NIC [%02d/%02d] %s Closest GPUs:", rank, nicIndex, numNics,
-               ibvDeviceList[nicIndex].name.c_str());
+        Log("[INFO] Rank %03d: NIC [%02d/%02d] %s Closest GPUs:", rank, nicIndex, numNics,
+                          ibvDeviceList[nicIndex].name.c_str());
         if (topo.closestGpusToNic[nicIndex].size() == 0) {
-          printf(" none");
+          Log(" none");
         } else {
           for (auto gpuIndex : topo.closestGpusToNic[nicIndex]) {
-            printf(" %d", gpuIndex);
+            Log(" %d", gpuIndex);
           }
         }
-        printf("\n");
+        Log("\n");
       }
 #endif
     }
@@ -6099,7 +6963,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   void System::SendRankTopo(int peerRank, RankTopology const& topo) const
   {
     SendData(peerRank, sizeof(topo.hostname), topo.hostname);
-    SendData(peerRank, sizeof(topo.ppodId), &topo.ppodId);
+    SendData(peerRank, sizeof(topo.ppodId), topo.ppodId);
     SendData(peerRank, sizeof(topo.vpodId), &topo.vpodId);
     SendMap(peerRank, topo.numExecutors);
     SendMap(peerRank, topo.numExecutorSubIndices);
@@ -6115,7 +6979,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
   void System::RecvRankTopo(int peerRank, RankTopology& topo) const
   {
     RecvData(peerRank, sizeof(topo.hostname), topo.hostname);
-    RecvData(peerRank, sizeof(topo.ppodId), &topo.ppodId);
+    RecvData(peerRank, sizeof(topo.ppodId), topo.ppodId);
     RecvData(peerRank, sizeof(topo.vpodId), &topo.vpodId);
     RecvMap(peerRank, topo.numExecutors);
     RecvMap(peerRank, topo.numExecutorSubIndices);
@@ -6196,7 +7060,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         } else {
           BROADCAST(setSize);
           tfrResult.perIterCUs[i].clear();
-          if (setSize > 0) {
+          for (size_t j = 0; j < setSize; j++) {
             pair<int, int> p;
             BROADCAST(p);
             tfrResult.perIterCUs[i].insert(p);
@@ -6243,7 +7107,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
         return {ERR_FATAL, "CPU index must be between 0 and %d inclusively", numCpus - 1};
       agent = cpuAgents[exeDevice.exeIndex];
       break;
-    case EXE_GPU_GFX: case EXE_GPU_DMA:
+    case EXE_GPU_GFX: case EXE_GPU_DMA: case EXE_GPU_BDMA:
       if (exeIndex < 0 || exeIndex >= numGpus)
         return {ERR_FATAL, "GPU index must be between 0 and %d inclusively", numGpus - 1};
       agent = gpuAgents[exeIndex];
@@ -6316,7 +7180,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       rankInfo[0] = localTopo;
       for (int peerRank = 1; peerRank < numRanks; peerRank++) {
         if (verbose) {
-          printf("[INFO] Rank 0 receives topology from Rank %d\n", peerRank);
+          Log("[INFO] Rank 0 receives topology from Rank %d\n", peerRank);
         }
         RecvRankTopo(peerRank, rankInfo[peerRank]);
       }
@@ -6325,7 +7189,7 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
       for (int peerRank = 1; peerRank < numRanks; peerRank++) {
         for (int i = 0; i < numRanks; i++) {
           if (verbose) {
-            printf("[INFO] Rank 0 sends topology %d to Rank %d\n", i, peerRank);
+            Log("[INFO] Rank 0 sends topology %d to Rank %d\n", i, peerRank);
           }
           SendRankTopo(peerRank, rankInfo[i]);
         }
@@ -6333,14 +7197,14 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     } else {
       // Send local topology info back to root
       if (verbose) {
-        printf("[INF0] Rank %d sends topology from Rank 0\n", rank);
+        Log("[INF0] Rank %d sends topology from Rank 0\n", rank);
       }
       SendRankTopo(0, localTopo);
 
       for (int i = 0; i < numRanks; i++) {
         RecvRankTopo(0, rankInfo[i]);
         if (verbose) {
-          printf("[INF0] Rank %d receives topology %d from Rank 0\n", rank, i);
+          Log("[INF0] Rank %d receives topology %d from Rank 0\n", rank, i);
         }
       }
     }
@@ -6409,16 +7273,47 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     return rankInfo[targetRank].hostname;
   }
 
-  std::string System::GetPpodId(int targetRank) const
+  int64_t System::GetPodIdx(int targetRank) const
   {
+    using PodKey = std::pair<std::array<char, 16>, int64_t>;
+
+    static std::map<PodKey, int64_t> podIdxMap;
+    static bool initialized = false;
+
+    if (!initialized) {
+      int64_t nextIdx = 0;
+      for (int r = 0; r < numRanks; r++) {
+        PodKey key;
+        memcpy(key.first.data(), rankInfo[r].ppodId, 16);
+        key.second = rankInfo[r].vpodId;
+
+        // vpodIdx == -1 means not part of any pod; assign -1 directly
+        if (key.second == -1) continue;
+
+        if (podIdxMap.find(key) == podIdxMap.end()) {
+          podIdxMap[key] = nextIdx++;
+        }
+      }
+      initialized = true;
+    }
+
     if (targetRank < 0 || targetRank >= numRanks) targetRank = rank;
-    return rankInfo[targetRank].ppodId;
+
+    PodKey key;
+    memcpy(key.first.data(), rankInfo[targetRank].ppodId, 16);
+    key.second = rankInfo[targetRank].vpodId;
+
+    if (key.second == -1) return -1;
+
+    return podIdxMap[key];
   }
 
-  int System::GetVpodId(int targetRank) const
+  bool System::IsSamePod(int targetRank, int sourceRank) const
   {
-    if (targetRank < 0 || targetRank >= numRanks) targetRank = rank;
-    return rankInfo[targetRank].vpodId;
+    if (sourceRank < 0 || sourceRank >= numRanks) sourceRank = rank;
+    if (GetPodIdx(sourceRank) == -1 || GetPodIdx(targetRank) == -1)
+      return false;
+    return GetPodIdx(sourceRank) == GetPodIdx(targetRank);
   }
 
   std::string System::GetExecutorName(ExeDevice exeDevice) const
@@ -6527,14 +7422,14 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
     return System::Get().GetHostname(targetRank);
   }
 
-  std::string GetPpodId(int targetRank)
+  int64_t GetPodIdx(int targetRank)
   {
-    return System::Get().GetPpodId(targetRank);
+    return System::Get().GetPodIdx(targetRank);
   }
 
-  int GetVpodId(int targetRank)
+  bool IsSamePod(int targetRank, int sourceRank)
   {
-    return System::Get().GetVpodId(targetRank);
+    return System::Get().IsSamePod(targetRank, sourceRank);
   }
 
   std::string GetExecutorName(ExeDevice exeDevice)
@@ -6559,18 +7454,28 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #undef hipError_t
 #undef hipEvent_t
 #undef hipStream_t
+#undef hipMemAllocationProp
+#undef hipMemGenericAllocationHandle_t
+#undef hipMemAccessDesc
+#undef hipMemFabricHandle_t
 
 // Enumerations
 #undef hipDeviceAttributeClockRate
-#undef hipDeviceAttributeMaxSharedMemoryPerMultiprocessor
 #undef hipDeviceAttributeMultiprocessorCount
 #undef hipDeviceAttributeWarpSize
 #undef hipErrorPeerAccessAlreadyEnabled
 #undef hipFuncCachePreferShared
 #undef hipMemcpyDefault
+#undef hipMemcpyKind
 #undef hipMemcpyDeviceToHost
 #undef hipMemcpyHostToDevice
 #undef hipSuccess
+#undef hipMemLocationTypeDevice
+#undef hipMemAllocationTypePinned
+//#undef hipMemAllocationTypeUncached
+#undef hipMemHandleTypeFabric
+#undef hipMemAllocationGranularityRecommended
+#undef hipMemAccessFlagsProtReadWrite
 
 // Functions
 #undef hipDeviceCanAccessPeer
@@ -6599,11 +7504,21 @@ static bool IsConfiguredGid(union ibv_gid const& gid)
 #undef hipStreamCreate
 #undef hipStreamDestroy
 #undef hipStreamSynchronize
+#undef hipMemGetAllocationGranularity
+#undef hipMemCreate
+#undef hipMemAddressReserve
+#undef hipMemMap
+#undef hipMemSetAccess
+#undef hipMemUnmap
+#undef hipMemRelease
+#undef hipMemAddressFree
+#undef hipMemExportToShareableHandle
+#undef hipMemImportFromShareableHandle
 #endif
 
 // Kernel macros
 #undef GetHwId
-#undef GetXccId
+//#undef GetXccId
 
 // Undefine helper macros
 #undef ERR_CHECK

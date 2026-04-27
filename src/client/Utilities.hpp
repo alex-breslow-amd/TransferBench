@@ -24,6 +24,7 @@ THE SOFTWARE.
 #include <iomanip>
 #include <unordered_map>
 #include <unordered_set>
+#include <type_traits>
 #include "TransferBench.hpp"
 
 namespace TransferBench::Utils
@@ -85,8 +86,7 @@ namespace TransferBench::Utils
 
   // Group information
   typedef std::tuple<
-    std::string,                   // RackId
-    int,                           // VPod
+    int64_t,                       // Pod Index
     std::vector<std::string>,      // CPU Names
     std::vector<int>,              // CPU #Subexecutors
     std::vector<std::string>,      // GPU Names
@@ -99,12 +99,16 @@ namespace TransferBench::Utils
     > GroupKey;
 
   typedef std::map<GroupKey, std::vector<int>> RankGroupMap;
+  typedef std::map<int64_t, std::vector<int>> RankPerPodMap;
 
   // Get information about how ranks can be organized into homogenous groups
   RankGroupMap& GetRankGroupMap();
 
   // Return the number of homogenous groups of ranks
-  int numRankGroups();
+  int GetNumRankGroups();
+
+  // Helper function for pod membership
+  RankPerPodMap& GetRankPerPodMap();
 
   // Helper function to convert an ExeType to a string
   std::string ExeTypeToStr(ExeType exeType);
@@ -146,6 +150,11 @@ namespace TransferBench::Utils
   std::string GetAllCpuMemTypeStr();
   std::string GetAllGpuMemTypeStr();
   std::string GetAllMemTypeStr(bool isCpu);
+
+  // Helper forwarders to allocation/deallocation functions
+  // Returns true if error occurs
+  bool AllocateMemory(MemDevice memDevice, size_t numBytes, void** memPtr);
+  bool DeallocateMemory(MemType memType, void *memPtr, size_t const bytes);
 
   // Implementation details below
   //================================================================
@@ -248,9 +257,9 @@ namespace TransferBench::Utils
 
     std::string borders[16] =
       {" ", "│", "│", "│",
-       "─", "┘", "┐", "┤",
-       "─", "└", "┌", "├",
-       "─", "┴", "┬", "┼"};
+       "-", "┘", "┐", "┤",
+       "-", "└", "┌", "├",
+       "-", "┴", "┬", "┼"};
 
     int mask;
     for (int rowIdx = 0; rowIdx <= numRows; rowIdx++) {
@@ -264,7 +273,7 @@ namespace TransferBench::Utils
           if (rowBorders[rowIdx].count(colIdx  )) mask |= BORDER_RIGHT;
           Print("%s", borders[mask].c_str());
           if (colIdx < numCols) {
-            std::string ch = rowBorders[rowIdx].count(colIdx) ? "─" : " ";
+            std::string ch = rowBorders[rowIdx].count(colIdx) ? "-" : " ";
             for (int i = 0; i < colWidth[colIdx]; i++) Print("%s", ch.c_str());
           }
         }
@@ -303,8 +312,7 @@ namespace TransferBench::Utils
       // Build GroupKey for each rank
       for (int rank = 0; rank < TransferBench::GetNumRanks(); rank++) {
 
-        std::string ppodId = TransferBench::GetPpodId(rank);
-        int         vpodId = TransferBench::GetVpodId(rank);
+        int64_t podId = TransferBench::GetPodIdx(rank);
 
         // CPU information
         int numCpus = TransferBench::GetNumExecutors(EXE_CPU, rank);
@@ -350,7 +358,7 @@ namespace TransferBench::Utils
           nicIsActive.push_back(TransferBench::NicIsActive(exeIndex, rank));
         }
 
-        GroupKey key(ppodId, vpodId,
+        GroupKey key(podId,
                      cpuNames, cpuNumSubExecs,
                      gpuNames, gpuNumSubExecs, gpuClosestCpu,
                      nicNames, nicClosestCpu, nicClosestGpu, nicIsActive);
@@ -367,16 +375,32 @@ namespace TransferBench::Utils
     return GetRankGroupMap().size();
   }
 
+  RankPerPodMap& GetRankPerPodMap()
+  {
+    static RankPerPodMap pods;
+    static bool initialized = false;
+
+    if (!initialized) {
+      for (int rank = 0; rank < TransferBench::GetNumRanks(); rank++) {
+        int64_t const podId = TransferBench::GetPodIdx(rank);
+        if (podId == -1) continue;
+        pods[podId].push_back(rank);
+      }
+      initialized = true;
+    }
+    return pods;
+  }
   // Helper function to convert an ExeType to a string
   std::string ExeTypeToStr(ExeType exeType)
   {
     switch (exeType) {
-    case EXE_CPU:         return "CPU";
-    case EXE_GPU_GFX:     return "GPU";
-    case EXE_GPU_DMA:     return "DMA";
-    case EXE_NIC:         return "NIC";
-    case EXE_NIC_NEAREST: return "NIC";
-    default:              return "N/A";
+    case EXE_CPU:           return "CPU";
+    case EXE_GPU_GFX:       return "GPU";
+    case EXE_GPU_DMA:       return "DMA";
+    case EXE_NIC:           return "NIC";
+    case EXE_NIC_NEAREST:   return "NIC";
+    case EXE_GPU_BDMA:      return "BMA";
+    default:                return "N/A";
     }
   }
 
@@ -393,6 +417,46 @@ namespace TransferBench::Utils
     }
     return ss.str();
   }
+
+  template <typename T>
+  struct is_std_vector : std::false_type {};
+
+  template <typename T, typename Alloc>
+  struct is_std_vector<std::vector<T, Alloc>> : std::true_type {};
+
+  // This function can be used to check if a value is identical across ranks
+  template <typename T>
+  bool IsUniform(const T& val) {
+    if constexpr (is_std_vector<T>::value) {
+      using Elem = typename T::value_type;
+      static_assert(std::is_trivially_copyable_v<Elem>, "vector element must be trivially copyable");
+
+      size_t size = val.size();
+      size_t rootSize = size;
+      System::Get().Broadcast(0, sizeof(rootSize), &rootSize);
+      if (size != rootSize) return false;
+
+      std::vector<Elem> ref = val;
+      System::Get().Broadcast(0, rootSize * sizeof(Elem), ref.data());
+
+      return (std::memcmp(ref.data(), val.data(), rootSize * sizeof(Elem)) == 0);
+    } else {
+      static_assert(std::is_trivially_copyable_v<T>, "Type must be trivially copyable");
+      T ref = val;
+      System::Get().Broadcast(0, sizeof(T), &ref);
+
+      return (std::memcmp(&ref, &val, sizeof(T)) == 0);
+    }
+  }
+
+  // Macro for use in presets that will return 1 if a value is not uniform across ranks
+#define IS_UNIFORM(val, name)                                                      \
+  do {                                                                             \
+    if (!Utils::IsUniform(val)) {                                                  \
+      Utils::Print("[ERROR] %s must be uniform across all ranks\n", name); \
+      return 1;                                                                    \
+    }                                                                              \
+  } while(0)
 
   // Helper function to determine if current rank does output
   bool RankDoesOutput()
@@ -458,7 +522,7 @@ namespace TransferBench::Utils
       ExeResult const& exeResult = exeInfoPair.second;
       numRows += 1 + exeResult.transferIdx.size();
       if (ev.showIterations) {
-        numRows += (numTimedIterations + 1);
+        numRows += (numTimedIterations + 1) * exeResult.transferIdx.size();
 
         // Check that per-iteration information exists
         for (int idx : exeResult.transferIdx) {
@@ -472,7 +536,9 @@ namespace TransferBench::Utils
       }
     }
 
-    TableHelper table(numRows, numCols);
+    int showNumIterations = (ev.numIterations < 0) ? 1 : 0;
+
+    TableHelper table(numRows+showNumIterations, numCols);
     for (int col = 1; col < numCols; col++)
       table.DrawColBorder(col);
 
@@ -506,9 +572,9 @@ namespace TransferBench::Utils
         TransferResult const& r = results.tfrResults[idx];
 
         table.Set(rowIdx, 0, "Transfer %-4d ", idx);
-        table.Set(rowIdx, 1, "%8.3f GB/s "       , r.avgBandwidthGbPerSec);
-        table.Set(rowIdx, 2, "%8.3f ms "         , r.avgDurationMsec);
-        table.Set(rowIdx, 3, "%12lu bytes "      , r.numBytes);
+        table.Set(rowIdx, 1, "%8.3f GB/s "   , r.avgBandwidthGbPerSec);
+        table.Set(rowIdx, 2, "%8.3f ms "     , r.avgDurationMsec);
+        table.Set(rowIdx, 3, "%12lu bytes "  , r.numBytes);
 
         char exeSubIndexStr[32] = "";
         if (t.exeSubIndex != -1)
@@ -596,8 +662,21 @@ namespace TransferBench::Utils
     table.Set(rowIdx, 3, "%12lu bytes "     , results.totalBytesTransferred);
     table.Set(rowIdx, 4, " Overhead %.3f ms", results.overheadMsec);
     table.SetCellAlignment(rowIdx, 4, TableHelper::ALIGN_LEFT);
-    table.DrawRowBorder(rowIdx + 1);
+    table.DrawRowBorder(rowIdx+1);
 
+    if (showNumIterations) {
+      rowIdx++;
+      table.Set(rowIdx, 0, "# Iters Run:");
+      table.Set(rowIdx, 1, "%lu ", numTimedIterations);
+      table.SetCellAlignment(rowIdx, 1, TableHelper::ALIGN_LEFT);
+      table.SetCellBorder(rowIdx, 0, 0);
+      table.SetCellBorder(rowIdx, 1, 0);
+      table.SetCellBorder(rowIdx, 2, 0);
+      table.SetCellBorder(rowIdx, 3, 0);
+      table.SetCellBorder(rowIdx, 4, 0);
+      table.DrawRowBorder(rowIdx);
+      table.DrawRowBorder(rowIdx+1);
+    }
     table.PrintTable(ev.outputToCsv, ev.showBorders);
   }
 
@@ -681,5 +760,14 @@ namespace TransferBench::Utils
   std::string GetAllMemTypeStr(bool isCpu)
   {
     return isCpu ? GetAllCpuMemTypeStr() : GetAllGpuMemTypeStr();
+  }
+
+  bool AllocateMemory(MemDevice memDevice, size_t numBytes, void** memPtr)
+  {
+    return (TransferBench::AllocateMemory(memDevice, numBytes, memPtr).errType != TransferBench::ERR_NONE);
+  }
+  bool DeallocateMemory(MemType memType, void *memPtr, size_t const bytes)
+  {
+    return (TransferBench::DeallocateMemory(memType, memPtr, bytes).errType != TransferBench::ERR_NONE);
   }
 };

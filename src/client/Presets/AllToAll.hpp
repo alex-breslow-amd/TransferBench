@@ -22,9 +22,10 @@ THE SOFTWARE.
 
 #include <limits>
 
-int AllToAllPreset(EnvVars&           ev,
-                    size_t      const  numBytesPerTransfer,
-                    std::string const  presetName)
+int AllToAllPreset(EnvVars&          ev,
+                   size_t      const numBytesPerTransfer,
+                   std::string const presetName,
+                   bool        const bytesSpecified)
 {
   enum
   {
