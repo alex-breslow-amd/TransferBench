@@ -225,6 +225,25 @@ __device__ inline void warpAsyncCopy(const uint8_t* global, uint8_t* lds, size_t
   }
 }
 
+// Issue EXACTLY `Sweeps` full-warp b128 async instructions (no wait) between a 128-byte-aligned global tile
+// and its LDS staging slot.  One sweep == one warp-wide async instruction moving (warpSize * 16) bytes, so a
+// tile moves (Sweeps * warpSize * 16) bytes and contributes EXACTLY `Sweeps` to asynccnt.  That fixed,
+// compile-time op count is what lets the pipeline below wait on immediate asynccnt values (the wait builtin
+// bakes its argument into the instruction).  Assumes the tile is full and 128-byte aligned -- no peel/tail --
+// which the caller guarantees, so unlike warpAsyncCopy the emitted op count never varies with the pointers.
+template<AsyncDir DIR, CachePolicy cp, int Sweeps>
+__device__ inline void warpAsyncTile(const uint8_t* global, uint8_t* lds){
+  const unsigned lane      = __lane_id();
+  const size_t   laneCount = (size_t)__builtin_amdgcn_wavefrontsize();
+  const size_t   laneByte  = (size_t)lane * BYTES_PER_LANE_B128;
+  const size_t   stride    = laneCount * BYTES_PER_LANE_B128;
+  #pragma unroll
+  for (int s = 0; s < Sweeps; ++s) {
+    const size_t off = (size_t)s * stride + laneByte;
+    asyncCopyB128<DIR, cp>(global + off, lds + off);
+  }
+}
+
 } // namespace async_detail
 
 // Warp-level async copy from global memory into LDS.  The entire warp calls this with the same arguments.
@@ -323,6 +342,89 @@ __device__ inline void warpGlobalCopy(const uint8_t* s, uint8_t* d, size_t n,
     for (size_t i = warpThread; i < n; i += warpThreads) d[i] = s[i];
 }
 
+// ---- software-pipelined (double/N-buffered) staging ------------------------
+// The single-buffered stageLoop below is correct but serial: every window fully drains its load (RAW) and
+// then its store (WAR) before the next window starts, so the HBM read and write phases never overlap and each
+// window pays the full load+store turnaround latency.  The pipeline here keeps several tiles in flight at once
+// through a ring of LDS buffers, overlapping the load of tile i+P with the drain of earlier stores.
+//
+// asynccnt model this relies on (per warp): loads retire in order among loads, stores retire in order among
+// stores, but loads and stores are UNORDERED relative to each other, and asynccnt is a single total of all
+// outstanding load+store ops.  So a wait to `K` only proves "at least (issued - K) ops of SOME kind are done";
+// to prove a specific op is done we assume the worst-case split where every still-outstanding op of the other
+// class is the one that hasn't finished.  That yields the two steady-state constants used below (with each
+// tile == PIPE_SWEEPS async ops):
+//   * RAW (load tile i done before storing it): wait to (PIPE_AHEAD-1)*PIPE_SWEEPS.
+//   * WAR (store of a buffer drained before that buffer is reloaded): wait to PIPE_SLACK*PIPE_SWEEPS.
+// PIPE_DEPTH buffers split into PIPE_AHEAD loads-in-flight ahead of the store cursor and PIPE_SLACK buffers of
+// store-drain slack (DEPTH = AHEAD + SLACK).  Peak ops in flight ~= max(AHEAD-1, SLACK) tiles, so DEPTH must be
+// >= 3 to overlap at all (a 2-buffer ping-pong provably collapses: proving the store drained while a load is
+// outstanding forces wait<0>, draining the load too).  All three are compile-time so every asynccnt argument
+// is an immediate.
+constexpr int PIPE_SWEEPS = 4;                          // b128 sweeps (== async ops) per pipeline tile
+constexpr int PIPE_DEPTH  = 4;                          // ring buffers (tiles) per issuing warp
+constexpr int PIPE_AHEAD  = PIPE_DEPTH / 2;             // P: loads kept in flight ahead of the store cursor
+constexpr int PIPE_SLACK  = PIPE_DEPTH - PIPE_AHEAD;    // Q: store-drain slack before a buffer is reloaded
+
+// Bytes staged per pipeline tile (runtime: depends on wavefront size) and per issuing warp's ring.
+__device__ inline size_t pipeTileBytes() {
+    return (size_t)PIPE_SWEEPS * (size_t)__builtin_amdgcn_wavefrontsize() * 16u;
+}
+__device__ inline size_t pipeWindowBytes() { return (size_t)PIPE_DEPTH * pipeTileBytes(); }
+
+// Pipelined HBM->LDS->HBM for one warp's [myStart, myStart+myBytes) range through a PIPE_DEPTH-tile LDS ring.
+// Requires `s + myStart`, `d + myStart`, and `myLds` to be 128-byte aligned (guaranteed by the caller), and
+// `myLds` to span at least pipeWindowBytes().  Each async op is a full-warp b128 sweep (== 1 asynccnt unit).
+template<CachePolicy cp>
+__device__ inline void pipelineStage(const uint8_t* s, uint8_t* d, uint8_t* myLds,
+                                     size_t myStart, size_t myBytes, size_t tileBytes) {
+    constexpr int U = PIPE_SWEEPS;
+    constexpr int B = PIPE_DEPTH;
+    constexpr int P = PIPE_AHEAD;
+    constexpr int Q = PIPE_SLACK;
+    using async_detail::AsyncDir;
+
+    const size_t   nTiles = myBytes / tileBytes;
+    const size_t   tail   = myBytes - nTiles * tileBytes;      // < tileBytes
+    const uint8_t* sBase  = s + myStart;
+    uint8_t*       dBase  = d + myStart;
+
+    // Prologue: prime up to P loads (fewer if the range has fewer than P tiles).
+    const size_t prime = nTiles < (size_t)P ? nTiles : (size_t)P;
+    for (size_t t = 0; t < prime; ++t)
+        async_detail::warpAsyncTile<AsyncDir::Load, cp, U>(
+            sBase + t * tileBytes, myLds + (t % (size_t)B) * tileBytes);
+
+    // Steady state: while we can still prefetch P tiles ahead, store tile i and prefetch tile i+P.
+    size_t i = 0;
+    for (; i + (size_t)P < nTiles; ++i) {
+        asyncWait<(P - 1) * U>();                              // RAW: load tile i has landed
+        async_detail::warpAsyncTile<AsyncDir::Store, cp, U>(
+            dBase + i * tileBytes, myLds + (i % (size_t)B) * tileBytes);
+        asyncWait<Q * U>();                                    // WAR: store of tile (i-Q) drained
+        async_detail::warpAsyncTile<AsyncDir::Load, cp, U>(
+            sBase + (i + P) * tileBytes, myLds + ((i + P) % (size_t)B) * tileBytes);
+    }
+
+    // Epilogue: every load is now issued.  A single full drain guarantees all remaining loads are done (a
+    // fixed asynccnt immediate would stop proving the last P-1 loads complete), after which the trailing P
+    // stores have no WAR hazard and just need one final drain.
+    if (nTiles > 0) {
+        asyncWait<0>();
+        for (; i < nTiles; ++i)
+            async_detail::warpAsyncTile<AsyncDir::Store, cp, U>(
+                dBase + i * tileBytes, myLds + (i % (size_t)B) * tileBytes);
+        asyncWait<0>();
+    }
+
+    // Tail (< one tile): stage through buffer 0, which the epilogue drain just freed.  Both sides are 128-byte
+    // aligned (tileBytes is a 128B multiple), so the Aligned fast path applies.
+    if (tail) {
+        asyncLoadToLDS  <SyncPolicy::Sync, cp, true>(sBase + nTiles * tileBytes, myLds, tail);
+        asyncStoreFromLDS<SyncPolicy::Sync, cp, true>(myLds, dBase + nTiles * tileBytes, tail);
+    }
+}
+
 // Stage [myStart, myStart+myBytes) HBM->LDS->HBM through this warp's single `window`-byte LDS buffer.
 // LoadAligned/StoreAligned pick the peel-free warpAsyncCopy fast path for the src/dst side respectively;
 // they are loop-invariant (myStart and window are both 128B multiples), so the choice is made once by the
@@ -382,10 +484,20 @@ __device__ inline void issue(void* dst, const void* src, size_t sizeBytes,
         return;
     }
 
-    // --- give each issuing warp a 128B-multiple LDS window -------------------
-    uint32_t maxIssuers = ldsBytes / WINDOW_GRAIN;      // #warps we can give a window
+    // --- give each issuing warp an LDS window --------------------------------
+    // Prefer the software-pipelined path: it needs a fixed pipeWindowBytes() ring per issuing warp. When the
+    // team's LDS can hold at least one such ring we hand every issuer exactly that (any surplus LDS is left
+    // unused -- pipeline depth is the compile-time PIPE_DEPTH, not the window size). Otherwise we fall back to
+    // the single-buffered scheme, which packs the LDS into the largest 128B-multiple windows it can.
+    const size_t   tileBytes = pipeTileBytes();
+    const size_t   pipeBytes = pipeWindowBytes();
+    const bool     pipeFits  = (size_t)ldsBytes >= pipeBytes;
+
+    uint32_t maxIssuers = pipeFits ? (uint32_t)((size_t)ldsBytes / pipeBytes)
+                                   : (ldsBytes / WINDOW_GRAIN);   // #warps we can give a window
     uint32_t issuers    = teamWarps < maxIssuers ? teamWarps : maxIssuers;
-    uint32_t window     = (ldsBytes / issuers) & ~(WINDOW_GRAIN - 1);  // per-warp 128B-multiple
+    uint32_t window     = pipeFits ? (uint32_t)pipeBytes
+                                   : ((ldsBytes / issuers) & ~(WINDOW_GRAIN - 1));  // per-warp 128B-multiple
     if (rank >= issuers) return;                        // this warp doesn't issue
 
     // Distribute the byte range across issuers in contiguous, 128B-aligned blocks. Splitting on whole
@@ -416,7 +528,12 @@ __device__ inline void issue(void* dst, const void* src, size_t sizeBytes,
     const bool loadAligned  = ldsAligned && (((uintptr_t)(s + myStart) & mask) == 0);
     const bool storeAligned = ldsAligned && (((uintptr_t)(d + myStart) & mask) == 0);
 
-    if (loadAligned && storeAligned)
+    printf("pipeFits: %d, loadAligned: %d, storeAligned: %d\n", pipeFits, loadAligned, storeAligned);
+    // Pipelined path only when both sides are 128B aligned (its fixed-op-count tiles skip the peel that the
+    // single-buffered stageLoop uses to absorb misalignment). Any other alignment falls back to stageLoop.
+    if (pipeFits && loadAligned && storeAligned)
+        pipelineStage<cp>(s, d, myLds, myStart, myBytes, tileBytes);
+    else if (loadAligned && storeAligned)
         stageLoop<cp, true,  true >(s, d, myLds, myStart, myBytes, window);
     else if (loadAligned)
         stageLoop<cp, true,  false>(s, d, myLds, myStart, myBytes, window);
